@@ -1,4 +1,4 @@
-// server.js (ESM) — Mailtrap Sandbox + adjunto <=5MB o link de descarga
+// server.js — versión final (Render + Google Drive)
 import 'dotenv/config';
 import express from 'express';
 import nodemailer from 'nodemailer';
@@ -13,23 +13,23 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
-// --------- Config ---------
+// --------- Configuración ---------
 const HOST = (process.env.HOST || 'http://localhost:3000').replace(/\/$/, '');
-const MAX_ATTACH = 5 * 1024 * 1024 - 1024; // ~5MB menos 1KB (borde seguro)
+const MAX_ATTACH = 5 * 1024 * 1024 - 1024; // Máx. 5 MB menos un margen
+const DOWNLOAD_URL = process.env.DOWNLOAD_URL; // 👈 Nueva variable para redirigir a Google Drive
 
+// Transporter SMTP (Mailtrap)
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,                             // p.ej. sandbox.smtp.mailtrap.io
-  port: Number(process.env.SMTP_PORT || 465),              // 465 en tu red
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 465),
   secure: String(process.env.SMTP_SECURE).toLowerCase() === 'true',
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
-  },
-  // Si tu red usa inspección TLS y rompe el handshake, descomenta:
-  // tls: { rejectUnauthorized: false }
+  }
 });
 
-// Diagnóstico de credenciales y conexión
+// Diagnóstico básico
 const must = (k) => {
   const v = (process.env[k] || '').trim();
   if (!v) throw new Error(`Falta variable ${k} en .env`);
@@ -37,7 +37,7 @@ const must = (k) => {
 };
 try {
   console.log('📦 HOST:', HOST);
-  console.log('✉️  SMTP_HOST:', must('SMTP_HOST'), 'PORT:', must('SMTP_PORT'), 'SECURE:', process.env.SMTP_SECURE);
+  console.log('✉️  SMTP_HOST:', must('SMTP_HOST'), 'PORT:', must('SMTP_PORT'));
   console.log('👤 SMTP_USER:', must('SMTP_USER').slice(0, 3) + '***');
 } catch (e) {
   console.error('❌ Config .env incompleta:', e.message);
@@ -54,59 +54,44 @@ transporter.verify((error) => {
 
 // --------- Rutas ---------
 
-// Salud
+// Ruta de prueba
 app.get('/api/ping', (_req, res) => res.json({ ok: true, message: 'Servidor funcionando.' }));
 
-// Descarga segura desde /private_files
-app.get('/download/:name', async (req, res) => {
-  const safeName = path.basename(req.params.name); // evita path traversal
-  const filePath = path.join(__dirname, 'private_files', safeName);
-  try {
-    await fs.promises.access(filePath, fs.constants.R_OK);
-    res.download(filePath, safeName);
-  } catch {
-    res.status(404).send('Archivo no encontrado');
+// Nueva ruta de descarga (redirige al link de Google Drive)
+app.get('/download', (req, res) => {
+  if (!DOWNLOAD_URL) {
+    return res.status(500).json({ error: 'No se configuró DOWNLOAD_URL en Render.' });
   }
+  console.log('🔗 Redirigiendo a Google Drive...');
+  return res.redirect(DOWNLOAD_URL);
 });
 
-// Envío de correo con adjunto <=5MB o link si es más grande
+// Envío de correo con adjunto o link de descarga externo
 app.post('/api/send-download', async (req, res) => {
   const { email, file } = req.body || {};
-  if (!email || !file) return res.status(400).json({ ok: false, error: 'Faltan campos requeridos (email, file).' });
+  if (!email) return res.status(400).json({ ok: false, error: 'Falta el correo destino.' });
 
   try {
-    const filePath = path.join(__dirname, 'private_files', path.basename(file));
-    const stats = await fs.promises.stat(filePath).catch(() => null);
-    if (!stats) return res.status(404).json({ ok: false, error: 'Archivo no encontrado en private_files.' });
-
-    const canAttach = stats.size <= MAX_ATTACH;
-    const downloadUrl = `${HOST}/download/${encodeURIComponent(path.basename(file))}`;
-
+    // Como el archivo grande ya no se almacena localmente, se envía solo el link
     const html = [
       `<p>Hola 👋</p>`,
       `<p>Gracias por tu descarga desde <b>Flujos Digitales</b>.</p>`,
-      `<p>Tu archivo: <b>${file}</b></p>`,
-      canAttach
-        ? `<p>Te lo adjuntamos en este correo.</p>`
-        : `<p>El archivo es pesado. Descárgalo desde este enlace:<br><a href="${downloadUrl}">${downloadUrl}</a></p>`,
+      `<p>Descarga tu archivo aquí:</p>`,
+      `<p><a href="${DOWNLOAD_URL}" target="_blank">${DOWNLOAD_URL}</a></p>`,
       `<p>¡Que lo disfrutes!</p>`
     ].join('');
 
     const mailOptions = {
-      from: `"${process.env.FROM_NAME || process.env.EMAIL_FROM_NAME || 'Flujos Digitales'}" <${process.env.FROM_EMAIL || process.env.EMAIL_FROM || 'no-reply@flujosdigitales.com'}>`,
+      from: `"${process.env.FROM_NAME || 'Flujos Digitales'}" <${process.env.FROM_EMAIL || 'no-reply@flujosdigitales.com'}>`,
       to: email,
       subject: 'Tu descarga está lista 📘',
-      text: canAttach ? `Adjuntamos ${file}` : `Descarga ${file} desde: ${downloadUrl}`,
+      text: `Descarga tu archivo desde: ${DOWNLOAD_URL}`,
       html
     };
 
-    if (canAttach) {
-      mailOptions.attachments = [{ filename: path.basename(file), path: filePath }];
-    }
-
     const info = await transporter.sendMail(mailOptions);
-    console.log('✅ Correo enviado:', info.messageId, '| adjunto:', canAttach, '| size:', stats.size);
-    res.json({ ok: true, attached: canAttach, messageId: info.messageId, downloadUrl: canAttach ? null : downloadUrl });
+    console.log('✅ Correo enviado:', info.messageId);
+    res.json({ ok: true, messageId: info.messageId, downloadUrl: DOWNLOAD_URL });
   } catch (error) {
     console.error('❌ Error al enviar correo:', error);
     res.status(500).json({ ok: false, error: String(error.message || error) });
@@ -114,8 +99,8 @@ app.post('/api/send-download', async (req, res) => {
 });
 
 // --------- Arranque ---------
-const PORT = 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🟢 Servidor listo en ${HOST} (puerto ${PORT})`);
   console.log(`💌 Usando Mailtrap Sandbox en puerto ${process.env.SMTP_PORT}`);
 });
