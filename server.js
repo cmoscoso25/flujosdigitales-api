@@ -24,10 +24,17 @@ app.use(express.urlencoded({ extended: true }));
 
 // ---------- Config ----------
 const HOST = (process.env.HOST || 'http://localhost:3000').replace(/\/$/, '');
-const DOWNLOAD_URL = process.env.DOWNLOAD_URL || ''; // Link directo de Google Drive
-const FLOW_API = 'https://www.flow.cl/api';
+const DOWNLOAD_URL = process.env.DOWNLOAD_URL || '';
+
+const FLOW_ENV = (process.env.FLOW_ENV || 'sandbox').toLowerCase(); // 'sandbox' | 'prod'
+const FLOW_API  = FLOW_ENV === 'prod' ? 'https://www.flow.cl/api'
+                                      : 'https://sandbox.flow.cl/api';
+const FLOW_PAY  = FLOW_ENV === 'prod' ? 'https://www.flow.cl/app/web/pay.php'
+                                      : 'https://sandbox.flow.cl/app/web/pay.php';
+
 const FLOW_API_KEY = process.env.FLOW_API_KEY || '';
-const FLOW_SECRET = process.env.FLOW_SECRET_KEY || '';
+const FLOW_SECRET  = process.env.FLOW_SECRET_KEY || '';
+
 
 // ---------- SMTP (Mailtrap Sandbox) ----------
 const transporter = nodemailer.createTransport({
