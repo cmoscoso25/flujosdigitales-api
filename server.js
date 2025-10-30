@@ -1,208 +1,179 @@
-// server.js — Flujos Digitales API (Render + Flow + Mailtrap + Drive)
-import 'dotenv/config';
-import express from 'express';
-import nodemailer from 'nodemailer';
-import crypto from 'crypto';
-import fetch from 'node-fetch';
-import path from 'path';
-import { fileURLToPath } from 'url';
+// server.js - Opción C Híbrida
+// Express + Nodemailer + reenviar email + fallback botón en gracias.html
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
+require("dotenv").config();
+const path = require("path");
+const fs = require("fs");
+const express = require("express");
+const rateLimit = require("express-rate-limit");
+const nodemailer = require("nodemailer");
 const app = express();
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ---------- Configuración principal ----------
-const HOST = (process.env.HOST || 'https://flujosdigitales-api.onrender.com').replace(/\/$/, '');
-const DOWNLOAD_URL = process.env.DOWNLOAD_URL || '';
+// === Config ===
+const ORDERS_DIR = path.join(__dirname, "orders"); // aquí guardas los JSON de cada orden (paid)
+if (!fs.existsSync(ORDERS_DIR)) fs.mkdirSync(ORDERS_DIR);
 
-const FLOW_ENV = (process.env.FLOW_ENV || 'prod').toLowerCase();
-const FLOW_API = FLOW_ENV === 'prod' ? 'https://www.flow.cl/api' : 'https://sandbox.flow.cl/api';
-const FLOW_PAY = FLOW_ENV === 'prod' ? 'https://www.flow.cl/app/web/pay.php' : 'https://sandbox.flow.cl/app/web/pay.php';
+const PRODUCT_FILE = process.env.PRODUCT_FILE || path.join(__dirname, "files/producto.pdf"); // tu ebook
+const DOWNLOAD_TOKEN_TTL_MIN = parseInt(process.env.DOWNLOAD_TOKEN_TTL_MIN || "120", 10);
 
-const FLOW_API_KEY = process.env.FLOW_API_KEY || '';
-const FLOW_SECRET = process.env.FLOW_SECRET_KEY || '';
-
-// ---------- Configuración SMTP ----------
+// === Email (SMTP 465 SSL típico) ===
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 465),
-  secure: String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  secure: true,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
 });
 
-(async () => {
-  try {
-    console.log('🟣 HOST:', HOST);
-    console.log('🟣 DOWNLOAD_URL configurado:', Boolean(DOWNLOAD_URL));
-    console.log('🟣 FLOW apiKey presente:', Boolean(FLOW_API_KEY));
-    await transporter.verify();
-    console.log('✅ SMTP listo');
-  } catch (e) {
-    console.error('❌ SMTP/Config error:', e.message);
-  }
-})();
-
-// ---------- Funciones auxiliares ----------
-function flowSign(params) {
-  const ordered = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join('&');
-  return crypto.createHmac('sha256', FLOW_SECRET).update(ordered).digest('hex');
+// Helper: leer/guardar orden
+function getOrderPath(orderId) {
+  return path.join(ORDERS_DIR, `${orderId}.json`);
+}
+function loadOrder(orderId) {
+  const p = getOrderPath(orderId);
+  if (!fs.existsSync(p)) return null;
+  return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+function saveOrder(order) {
+  fs.writeFileSync(getOrderPath(order.id), JSON.stringify(order, null, 2));
 }
 
-async function flowPost(endpoint, params) {
-  const body = new URLSearchParams(params);
-  const res = await fetch(`${FLOW_API}${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+// Helper: token de descarga efímero
+function createDownloadToken(orderId) {
+  const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MIN * 60 * 1000;
+  const order = loadOrder(orderId);
+  if (!order) return null;
+  order.downloadToken = { token, expiresAt };
+  saveOrder(order);
+  return token;
+}
+function validateToken(order, token) {
+  return (
+    order.downloadToken &&
+    order.downloadToken.token === token &&
+    Date.now() < Number(order.downloadToken.expiresAt || 0)
+  );
+}
+
+// === Envío de email con link de descarga ===
+async function sendDownloadEmail({ to, orderId }) {
+  const order = loadOrder(orderId);
+  if (!order) throw new Error("Orden no existe.");
+  if (order.status !== "paid") throw new Error("Orden no está pagada.");
+
+  const token = createDownloadToken(orderId);
+  const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3000";
+  const downloadUrl = `${baseUrl}/api/download?orderId=${encodeURIComponent(orderId)}&token=${encodeURIComponent(token)}`;
+
+  const html = `
+    <p>¡Gracias por tu compra!</p>
+    <p>Tu descarga está lista: <a href="${downloadUrl}">Descargar ahora</a></p>
+    <p>Si el enlace vence, puedes volver a generar uno desde la página de gracias.</p>
+  `;
+
+  await transporter.sendMail({
+    from: process.env.MAIL_FROM || '"Flujos Digitales" <no-reply@flujosdigitales.com>',
+    to,
+    subject: process.env.MAIL_SUBJECT || "Tu descarga está lista",
+    html,
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Flow ${endpoint} ${res.status} ${text}`);
-  }
-  return res.json();
+
+  return { downloadUrl };
 }
 
-// ---------- Rutas ----------
-app.get('/api/ping', (_req, res) => res.json({ ok: true, message: 'Servidor funcionando.' }));
+// === Static (landing + gracias) ===
+app.use(express.static(path.join(__dirname, "public"))); // coloca gracias.html en /public
 
-app.get('/download', (_req, res) => {
-  if (!DOWNLOAD_URL) return res.status(500).json({ error: 'Falta DOWNLOAD_URL' });
-  console.log('🔗 /download → redirigiendo a Drive');
-  return res.redirect(DOWNLOAD_URL);
-});
-
-// ---------- Envío de correo manual ----------
-app.post('/api/send-download', async (req, res) => {
+// === Endpoint Webhook (Flow) -> marca orden pagada y dispara email ===
+// ADAPTA este endpoint al que ya tengas de Flow; aquí suponemos que recibes {orderId, email, paid:true}
+app.post("/webhook/flow", async (req, res) => {
   try {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ ok: false, error: 'Falta email' });
-    if (!DOWNLOAD_URL) return res.status(500).json({ ok: false, error: 'Falta DOWNLOAD_URL' });
+    const { orderId, email, paid } = req.body;
 
-    const html = `
-      <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;line-height:1.5">
-        <h2>¡Tu descarga está lista!</h2>
-        <p>Gracias por tu interés en <b>Flujos Digitales</b>.</p>
-        <a href="${DOWNLOAD_URL}" target="_blank" rel="noopener"
-           style="background:#2563eb;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">
-          Descargar ahora
-        </a>
-      </div>
-    `;
+    // 1) Validaciones mínimas (agrega tu verificación de firma de Flow si ya la tienes)
+    if (!orderId) return res.status(400).json({ ok: false, error: "Falta orderId" });
 
-    const info = await transporter.sendMail({
-      from: `"${process.env.FROM_NAME || 'Flujos Digitales'}" <${process.env.FROM_EMAIL || 'no-reply@flujosdigitales.com'}>`,
-      to: email,
-      subject: 'Tu descarga está lista 📘',
-      html,
-    });
-
-    console.log('✅ Email enviado:', info.messageId);
-    res.json({ ok: true, messageId: info.messageId });
-  } catch (e) {
-    console.error('❌ /api/send-download error:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ---------- Crear orden de pago Flow ----------
-app.post('/api/flow/create-order', async (req, res) => {
-  try {
-    const { email, amount = 9900 } = req.body || {};
-    if (!email) return res.status(400).json({ ok: false, error: 'Falta email' });
-
-    const commerceOrder = `FD-${Date.now()}`;
-    const params = {
-      apiKey: FLOW_API_KEY,
-      commerceOrder,
-      subject: 'Ebook Flujos Digitales',
-      currency: 'CLP',
-      amount,
-      email,
-      urlConfirmation: 'https://flujosdigitales-api.onrender.com/api/flow/webhook',
-      urlReturn: 'https://flujosdigitales.com/gracias',
+    // 2) Persistir/actualizar orden
+    const current = loadOrder(orderId) || { id: orderId };
+    const order = {
+      ...current,
+      id: orderId,
+      email: email || current.email,
+      status: paid ? "paid" : current.status || "pending",
+      productPath: PRODUCT_FILE,
+      updatedAt: new Date().toISOString(),
     };
+    saveOrder(order);
 
-    const s = flowSign(params);
-    const data = await flowPost('/payment/create', { ...params, s });
-    const paymentUrl = `${FLOW_PAY}?token=${data.token}`;
+    // 3) Si quedó pagada, intenta enviar correo (no bloquea la descarga en gracias.html)
+    if (order.status === "paid" && order.email) {
+      try {
+        await sendDownloadEmail({ to: order.email, orderId: order.id });
+      } catch (e) {
+        console.warn("Fallo envío SMTP, pero seguimos con fallback botón:", e.message);
+        // No devolvemos 500: la página de gracias permite descargar igual.
+      }
+    }
 
-    console.log('🧾 Orden creada:', commerceOrder, '| token:', data.token);
-    res.json({ ok: true, paymentUrl, token: data.token, order: commerceOrder });
-  } catch (e) {
-    console.error('❌ /api/flow/create-order error:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: "Webhook error" });
   }
 });
 
-// ---------- Webhook Flow ----------
-app.post('/api/flow/webhook', async (req, res) => {
+// === API: generar token y forzar descarga (usada por botón en gracias.html) ===
+app.post("/api/generate-download", (req, res) => {
+  const { orderId } = req.body;
+  const order = loadOrder(orderId);
+  if (!order || order.status !== "paid") {
+    return res.status(400).json({ ok: false, error: "Orden no válida o no pagada" });
+  }
+  const token = createDownloadToken(orderId);
+  const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3000";
+  const url = `${baseUrl}/api/download?orderId=${encodeURIComponent(orderId)}&token=${encodeURIComponent(token)}`;
+  res.json({ ok: true, url });
+});
+
+// === API: descarga protegida por token efímero ===
+app.get("/api/download", (req, res) => {
+  const { orderId, token } = req.query;
+  const order = loadOrder(String(orderId || ""));
+  if (!order || !validateToken(order, String(token || ""))) {
+    return res.status(401).send("Token inválido o expirado");
+  }
+  res.download(order.productPath, path.basename(order.productPath));
+});
+
+// === API: reenviar email ===
+const resendLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 min
+  max: 3,
+});
+app.post("/api/resend", resendLimiter, async (req, res) => {
   try {
-    const payload = { ...req.body };
-    const signature = payload.s;
-    delete payload.s;
+    const { orderId } = req.query; // como en tu nota: POST /api/resend?orderId=...
+    const order = loadOrder(String(orderId || ""));
+    if (!order) return res.status(404).json({ ok: false, error: "Orden no encontrada" });
+    if (order.status !== "paid") return res.status(400).json({ ok: false, error: "Orden no pagada" });
+    if (!order.email) return res.status(400).json({ ok: false, error: "La orden no tiene email" });
 
-    const expected = flowSign(payload);
-    if (signature !== expected) {
-      console.warn('⚠️ Firma Flow inválida');
-      return res.status(403).send('invalid signature');
-    }
-
-    if (payload.token && !payload.status) {
-      const p = { apiKey: FLOW_API_KEY, token: payload.token };
-      const s = flowSign(p);
-      const st = await flowPost('/payment/getStatus', { ...p, s });
-      payload.status = st.status;
-      payload.commerceOrder = st.commerceOrder;
-      payload.payer = st.payer;
-    }
-
-    const paid = String(payload.status) === '2' || String(payload.status).toLowerCase() === 'paid';
-    if (!paid) {
-      console.log('ℹ️ Webhook recibido pero no pagado:', payload.status);
-      return res.send('ok');
-    }
-
-    const toEmail = payload.payer?.email || req.body.email || process.env.TEST_EMAIL;
-    if (!toEmail) {
-      console.warn('⚠️ Webhook pagado sin email');
-      return res.send('ok');
-    }
-
-    const html = `
-      <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;line-height:1.5">
-        <h2>¡Gracias por tu compra!</h2>
-        <p>Orden: <b>${payload.commerceOrder}</b></p>
-        <p>Descarga tu eBook aquí:</p>
-        <a href="${DOWNLOAD_URL}" target="_blank" rel="noopener"
-           style="background:#16a34a;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">
-          Descargar ahora
-        </a>
-      </div>
-    `;
-
-    await transporter.sendMail({
-      from: `"${process.env.FROM_NAME || 'Flujos Digitales'}" <${process.env.FROM_EMAIL || 'no-reply@flujosdigitales.com'}>`,
-      to: toEmail,
-      subject: 'Tu descarga de Flujos Digitales',
-      html,
-    });
-
-    console.log('✅ Mail post-pago enviado a:', toEmail);
-    res.send('ok');
+    await sendDownloadEmail({ to: order.email, orderId: order.id });
+    res.json({ ok: true, message: "Correo reenviado" });
   } catch (e) {
-    console.error('❌ /api/flow/webhook error:', e);
-    res.status(500).send('error');
+    console.error(e);
+    res.status(500).json({ ok: false, error: "No se pudo reenviar el correo" });
   }
 });
 
-// ---------- Arranque ----------
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🟢 Servidor listo en ${HOST} (puerto ${PORT})`);
-});
+// === Salud ===
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor listo en http://localhost:${PORT}`));
