@@ -149,7 +149,7 @@ app.post('/api/flow/create-order', async (req, res) => {
     const s = flowSign(params);
     const data = await flowPost('/payment/create', { ...params, s }); // => { url, token }
 
-    const paymentUrl = `${data.url}?token=${data.token}`;
+    const paymentUrl = `${FLOW_PAY}?token=${data.token}`;
     console.log('🧾 Orden creada:', commerceOrder, '| token:', data.token);
     res.json({ ok: true, paymentUrl, token: data.token, order: commerceOrder });
   } catch (e) {
