@@ -1,179 +1,228 @@
-// server.js - Opción C Híbrida
-// Express + Nodemailer + reenviar email + fallback botón en gracias.html
+// server.js  —  Flujos Digitales (híbrido con Resend API)
+// Node >= 18 (tiene fetch nativo). En Render estás usando Node 22, OK.
 
-require("dotenv").config();
-const path = require("path");
-const fs = require("fs");
-const express = require("express");
-const rateLimit = require("express-rate-limit");
-const nodemailer = require("nodemailer");
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const rateLimit = require('express-rate-limit');
+
 const app = express();
+const PORT = process.env.PORT || 10000;
 
+// ---------- Config / Paths ----------
+const ROOT_DIR = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const PRIVATE_DIR = path.join(ROOT_DIR, 'private_files');
+const ORDERS_DIR = path.join(PRIVATE_DIR, 'orders');
+
+// Archivo que se entrega en la página de gracias (híbrido).
+// Ej: "Ebook-1_C.pdf" (debe estar en /public)
+const PRODUCT_FILE = process.env.PRODUCT_FILE || 'Ebook-1_C.pdf';
+
+// URL pública base del servicio en Render (sin trailing slash).
+// Ej: https://flujosdigitales-api.onrender.com
+const PUBLIC_BASE_URL =
+  (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '') ||
+  'https://flujosdigitales-api.onrender.com';
+
+// From y subject del correo
+const MAIL_FROM = process.env.MAIL_FROM || 'Flujos Digitales <no-reply@flujosdigitales.com>';
+const MAIL_SUBJECT = process.env.MAIL_SUBJECT || 'Tu eBook de Flujos Digitales';
+
+// API Key de Resend
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
+// ---------- Middlewares ----------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// === Config ===
-const ORDERS_DIR = path.join(__dirname, "orders"); // aquí guardas los JSON de cada orden (paid)
-if (!fs.existsSync(ORDERS_DIR)) fs.mkdirSync(ORDERS_DIR);
+// Archivos estáticos (gracias.html + PDF)
+app.use(express.static(PUBLIC_DIR, { maxAge: '1h', index: false }));
 
-const PRODUCT_FILE = process.env.PRODUCT_FILE || path.join(__dirname, "files/producto.pdf"); // tu ebook
-const DOWNLOAD_TOKEN_TTL_MIN = parseInt(process.env.DOWNLOAD_TOKEN_TTL_MIN || "120", 10);
-
-// === Email (SMTP 465 SSL típico) ===
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: true,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
+// Rate limit para endpoints sensibles
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 min
+  max: 60,             // 60 req/min
 });
+app.use('/api/', limiter);
+app.use('/webhook/', limiter);
 
-// Helper: leer/guardar orden
-function getOrderPath(orderId) {
+// ---------- Utilidades ----------
+async function ensureDirs() {
+  if (!fs.existsSync(PRIVATE_DIR)) await fsp.mkdir(PRIVATE_DIR, { recursive: true });
+  if (!fs.existsSync(ORDERS_DIR)) await fsp.mkdir(ORDERS_DIR, { recursive: true });
+}
+
+function orderPath(orderId) {
   return path.join(ORDERS_DIR, `${orderId}.json`);
 }
-function loadOrder(orderId) {
-  const p = getOrderPath(orderId);
+
+async function saveOrder(order) {
+  await ensureDirs();
+  const p = orderPath(order.orderId);
+  await fsp.writeFile(p, JSON.stringify(order, null, 2), 'utf8');
+}
+
+async function loadOrder(orderId) {
+  const p = orderPath(orderId);
   if (!fs.existsSync(p)) return null;
-  return JSON.parse(fs.readFileSync(p, "utf8"));
-}
-function saveOrder(order) {
-  fs.writeFileSync(getOrderPath(order.id), JSON.stringify(order, null, 2));
+  const raw = await fsp.readFile(p, 'utf8');
+  return JSON.parse(raw);
 }
 
-// Helper: token de descarga efímero
-function createDownloadToken(orderId) {
-  const token = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-  const expiresAt = Date.now() + DOWNLOAD_TOKEN_TTL_MIN * 60 * 1000;
-  const order = loadOrder(orderId);
-  if (!order) return null;
-  order.downloadToken = { token, expiresAt };
-  saveOrder(order);
-  return token;
-}
-function validateToken(order, token) {
-  return (
-    order.downloadToken &&
-    order.downloadToken.token === token &&
-    Date.now() < Number(order.downloadToken.expiresAt || 0)
-  );
-}
-
-// === Envío de email con link de descarga ===
-async function sendDownloadEmail({ to, orderId }) {
-  const order = loadOrder(orderId);
-  if (!order) throw new Error("Orden no existe.");
-  if (order.status !== "paid") throw new Error("Orden no está pagada.");
-
-  const token = createDownloadToken(orderId);
-  const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3000";
-  const downloadUrl = `${baseUrl}/api/download?orderId=${encodeURIComponent(orderId)}&token=${encodeURIComponent(token)}`;
-
-  const html = `
-    <p>¡Gracias por tu compra!</p>
-    <p>Tu descarga está lista: <a href="${downloadUrl}">Descargar ahora</a></p>
-    <p>Si el enlace vence, puedes volver a generar uno desde la página de gracias.</p>
+// Plantilla de email (HTML simple)
+function buildEmailHtml(downloadUrl) {
+  return `
+  <div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:auto">
+    <h2>¡Gracias por tu compra!</h2>
+    <p>Tu pago fue procesado correctamente. Aquí tienes tu eBook:</p>
+    <p><a href="${downloadUrl}" style="background:#0072ff;color:#fff;text-decoration:none;padding:12px 18px;border-radius:6px;display:inline-block">📘 Descargar eBook</a></p>
+    <p>Si tienes problemas con el enlace, copia y pega esta URL en tu navegador:</p>
+    <p><a href="${downloadUrl}">${downloadUrl}</a></p>
+    <hr/>
+    <p style="color:#667">Flujos Digitales</p>
+  </div>
   `;
+}
 
-  await transporter.sendMail({
-    from: process.env.MAIL_FROM || '"Flujos Digitales" <no-reply@flujosdigitales.com>',
-    to,
-    subject: process.env.MAIL_SUBJECT || "Tu descarga está lista",
-    html,
+// Envío de correo vía Resend (HTTPS 443)
+async function sendMailResend(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    throw new Error('RESEND_API_KEY no configurada');
+  }
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [to],
+      subject,
+      html
+    })
   });
 
-  return { downloadUrl };
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Resend error ${res.status}: ${text}`);
+  }
+  return res.json();
 }
 
-// === Static (landing + gracias) ===
-app.use(express.static(path.join(__dirname, "public"))); // coloca gracias.html en /public
+// ---------- Endpoints ----------
 
-// === Endpoint Webhook (Flow) -> marca orden pagada y dispara email ===
-// ADAPTA este endpoint al que ya tengas de Flow; aquí suponemos que recibes {orderId, email, paid:true}
-app.post("/webhook/flow", async (req, res) => {
+// Healthcheck
+app.get('/api/health', async (req, res) => {
   try {
-    const { orderId, email, paid } = req.body;
+    await ensureDirs();
+    const pdfExists = fs.existsSync(path.join(PUBLIC_DIR, PRODUCT_FILE));
+    res.json({
+      ok: true,
+      service: 'flujosdigitales-api',
+      pdfExists,
+      productFile: PRODUCT_FILE,
+      baseUrl: PUBLIC_BASE_URL,
+      time: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('health error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-    // 1) Validaciones mínimas (agrega tu verificación de firma de Flow si ya la tienes)
-    if (!orderId) return res.status(400).json({ ok: false, error: "Falta orderId" });
+// Webhook de Flow (simulado/real)
+// Espera body: { orderId, email, paid: true/false }
+app.post('/webhook/flow', async (req, res) => {
+  try {
+    const { orderId, email, paid } = req.body || {};
+    if (!orderId || !email) {
+      return res.status(400).json({ ok: false, error: 'orderId y email son requeridos' });
+    }
 
-    // 2) Persistir/actualizar orden
-    const current = loadOrder(orderId) || { id: orderId };
+    const now = new Date().toISOString();
+    const downloadUrl = `${PUBLIC_BASE_URL}/${encodeURIComponent(PRODUCT_FILE)}`;
+
     const order = {
-      ...current,
-      id: orderId,
-      email: email || current.email,
-      status: paid ? "paid" : current.status || "pending",
-      productPath: PRODUCT_FILE,
-      updatedAt: new Date().toISOString(),
+      orderId,
+      email,
+      paid: !!paid,
+      createdAt: now,
+      updatedAt: now,
+      downloadUrl,
+      emailedAt: null,
+      emailProvider: 'resend'
     };
-    saveOrder(order);
 
-    // 3) Si quedó pagada, intenta enviar correo (no bloquea la descarga en gracias.html)
-    if (order.status === "paid" && order.email) {
+    // Guardamos/actualizamos orden
+    await saveOrder(order);
+
+    let emailSent = false;
+    let emailError = null;
+
+    // Si está pagada, intentamos enviar el correo
+    if (order.paid) {
       try {
-        await sendDownloadEmail({ to: order.email, orderId: order.id });
-      } catch (e) {
-        console.warn("Fallo envío SMTP, pero seguimos con fallback botón:", e.message);
-        // No devolvemos 500: la página de gracias permite descargar igual.
+        const html = buildEmailHtml(downloadUrl);
+        await sendMailResend(order.email, MAIL_SUBJECT, html);
+        order.emailedAt = new Date().toISOString();
+        emailSent = true;
+        await saveOrder(order);
+        console.log(`✅ Email enviado a ${order.email} (orderId: ${order.orderId})`);
+      } catch (err) {
+        emailError = err.message;
+        console.error('❌ Error enviando correo (Resend):', err);
       }
     }
 
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: "Webhook error" });
-  }
-});
-
-// === API: generar token y forzar descarga (usada por botón en gracias.html) ===
-app.post("/api/generate-download", (req, res) => {
-  const { orderId } = req.body;
-  const order = loadOrder(orderId);
-  if (!order || order.status !== "paid") {
-    return res.status(400).json({ ok: false, error: "Orden no válida o no pagada" });
-  }
-  const token = createDownloadToken(orderId);
-  const baseUrl = process.env.PUBLIC_BASE_URL || "http://localhost:3000";
-  const url = `${baseUrl}/api/download?orderId=${encodeURIComponent(orderId)}&token=${encodeURIComponent(token)}`;
-  res.json({ ok: true, url });
-});
-
-// === API: descarga protegida por token efímero ===
-app.get("/api/download", (req, res) => {
-  const { orderId, token } = req.query;
-  const order = loadOrder(String(orderId || ""));
-  if (!order || !validateToken(order, String(token || ""))) {
-    return res.status(401).send("Token inválido o expirado");
-  }
-  res.download(order.productPath, path.basename(order.productPath));
-});
-
-// === API: reenviar email ===
-const resendLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 5 min
-  max: 3,
-});
-app.post("/api/resend", resendLimiter, async (req, res) => {
-  try {
-    const { orderId } = req.query; // como en tu nota: POST /api/resend?orderId=...
-    const order = loadOrder(String(orderId || ""));
-    if (!order) return res.status(404).json({ ok: false, error: "Orden no encontrada" });
-    if (order.status !== "paid") return res.status(400).json({ ok: false, error: "Orden no pagada" });
-    if (!order.email) return res.status(400).json({ ok: false, error: "La orden no tiene email" });
-
-    await sendDownloadEmail({ to: order.email, orderId: order.id });
-    res.json({ ok: true, message: "Correo reenviado" });
+    // Respuesta híbrida: aunque falle el correo, la descarga está en la página
+    res.json({
+      ok: true,
+      emailSent,
+      emailError,
+      downloadUrl
+    });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "No se pudo reenviar el correo" });
+    console.error('webhook error:', e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// === Salud ===
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+// Reenviar email manualmente
+// POST /api/resend?orderId=ABC123  (o body {orderId})
+app.post('/api/resend', async (req, res) => {
+  try {
+    const orderId = (req.query.orderId || (req.body && req.body.orderId) || '').trim();
+    if (!orderId) return res.status(400).json({ ok: false, error: 'orderId requerido' });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor listo en http://localhost:${PORT}`));
+    const order = await loadOrder(orderId);
+    if (!order) return res.status(404).json({ ok: false, error: 'Orden no encontrada' });
+
+    const html = buildEmailHtml(order.downloadUrl);
+    await sendMailResend(order.email, MAIL_SUBJECT, html);
+
+    order.emailedAt = new Date().toISOString();
+    await saveOrder(order);
+    console.log(`📨 Reenvío exitoso a ${order.email} (orderId: ${order.orderId})`);
+
+    res.json({ ok: true, emailedAt: order.emailedAt });
+  } catch (e) {
+    console.error('resend error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Servir gracias.html explícitamente (opcional)
+app.get('/gracias.html', (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'gracias.html'));
+});
+
+// ---------- Start ----------
+app.listen(PORT, async () => {
+  await ensureDirs();
+  console.log(`Servidor listo en http://localhost:${PORT}`);
+  console.log(`Your service is live 🎉`);
+});
