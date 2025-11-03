@@ -1,108 +1,100 @@
 import express from "express";
 import bodyParser from "body-parser";
-import fs from "fs";
-import path from "path";
+import cors from "cors";
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Resend } from "resend";
 
 dotenv.config();
 
 const app = express();
-const resend = new Resend(process.env.RESEND_API_KEY);
-
+app.use(cors());
 app.use(bodyParser.json());
-app.use(express.static("public"));
 
-// ✅ Ruta webhook de Flow
+// Configurar ruta y resend
+const resend = new Resend(process.env.RESEND_API_KEY);
+const PORT = process.env.PORT || 10000;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ruta para servir archivos estáticos (ej: eBooks)
+app.use(express.static(path.join(__dirname, "private_files")));
+
+// Ruta principal de prueba
+app.get("/", (req, res) => {
+  res.send("✅ API Flujos Digitales activa y funcionando correctamente.");
+});
+
+// Webhook de Flow (simulado o real)
 app.post("/webhook/flow", async (req, res) => {
-  const { orderId, email, paid } = req.body;
-
-  if (!paid) {
-    return res.json({ ok: false, message: "Pago no completado" });
-  }
-
-  console.log(`📩 Enviando eBook a ${email} por la orden ${orderId}...`);
-
-  const filePath = path.resolve(process.env.EBOOK_PATH);
-  const downloadUrl = `${process.env.BASE_URL}/Ebook-1_C.pdf`;
-
   try {
-    // Envío del correo
-    const data = await resend.emails.send({
-      from: process.env.MAIL_FROM,
+    const { orderId, email, paid } = req.body;
+
+    if (!paid) {
+      return res.status(400).json({
+        ok: false,
+        message: "Pago no confirmado. No se envió el correo.",
+      });
+    }
+
+    const downloadUrl = `${process.env.DOMAIN}/Ebook-1_C.pdf`;
+
+    // Envío de correo con Resend
+    const htmlContent = `
+      <div style="font-family:Arial, sans-serif; color:#333; max-width:600px; margin:auto;">
+        <h2>¡Gracias por tu compra en Flujos Digitales!</h2>
+        <p>Tu pago fue procesado correctamente.</p>
+        <p>Puedes descargar tu eBook en el siguiente enlace:</p>
+        <p>
+          <a href="${downloadUrl}" 
+             style="background-color:#007bff;color:white;padding:10px 15px;text-decoration:none;border-radius:5px;">
+            📘 Descargar eBook
+          </a>
+        </p>
+        <hr>
+        <p style="font-size:14px;color:#555">
+          Atentamente,<br>
+          <b>Equipo de Flujos Digitales</b><br>
+          <a href="https://flujosdigitales.com">flujosdigitales.com</a><br>
+          <small>Este correo fue enviado automáticamente. No respondas a este mensaje.</small>
+        </p>
+      </div>
+    `;
+
+    const { data, error } = await resend.emails.send({
+      from: process.env.MAIL_FROM || "Flujos Digitales <no-reply@flujosdigitales.com>",
       to: email,
       subject: "Tu eBook de Flujos Digitales 📘",
-      html: `
-        <div style="font-family:Arial,sans-serif;padding:20px;color:#333;">
-          <h2>¡Gracias por tu compra en Flujos Digitales!</h2>
-          <p>Tu pago fue procesado correctamente.</p>
-          <p>Puedes descargar tu eBook en el siguiente enlace:</p>
-          <p>
-            <a href="${downloadUrl}" 
-               style="background:#007bff;color:#fff;padding:10px 18px;
-               border-radius:6px;text-decoration:none;">
-               📘 Descargar eBook
-            </a>
-          </p>
-          <hr style="margin-top:30px;">
-          <p style="font-size:12px;color:#666;">
-            Este correo fue enviado automáticamente por Flujos Digitales.
-          </p>
-        </div>
-      `,
+      html: htmlContent,
     });
 
-    console.log("✅ Correo enviado correctamente:", data.id);
+    if (error) {
+      console.error("❌ Error al enviar correo:", error);
+      return res.json({
+        ok: true,
+        emailSent: false,
+        emailError: error.message,
+        downloadUrl,
+      });
+    }
 
-    res.json({
+    console.log(`✅ Correo enviado a ${email} con orden ${orderId}`);
+    return res.json({
       ok: true,
       message: "Correo enviado correctamente",
       emailSent: true,
       downloadUrl,
     });
-  } catch (error) {
-    console.error("❌ Error al enviar correo:", error);
-
-    // En caso de error, igualmente entregamos el link de descarga
-    res.json({
-      ok: true,
-      message: "Error al enviar correo, se entrega el link directo",
-      emailSent: false,
-      error: error.message,
-      downloadUrl,
-    });
-  }
-});
-
-// ✅ Ruta manual de reenvío (para botón “¿No recibiste el correo?”)
-app.get("/api/resend", async (req, res) => {
-  const { orderId, email } = req.query;
-  if (!email) return res.status(400).send("Falta el email.");
-
-  try {
-    const data = await resend.emails.send({
-      from: process.env.MAIL_FROM,
-      to: email,
-      subject: "Reenvío de tu eBook de Flujos Digitales 📘",
-      html: `
-        <h3>Hola 👋</h3>
-        <p>Te reenviamos el enlace para descargar tu eBook:</p>
-        <a href="${process.env.BASE_URL}/Ebook-1_C.pdf" 
-           style="background:#007bff;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;">
-           Descargar eBook
-        </a>
-      `,
-    });
-
-    console.log(`🔁 Reenvío exitoso para ${email}`);
-    res.json({ ok: true, reSent: true, id: data.id });
   } catch (err) {
-    console.error("Error en reenvío:", err);
-    res.json({ ok: false, reSent: false, error: err.message });
+    console.error("Error general en webhook:", err);
+    return res.status(500).json({
+      ok: false,
+      message: "Error interno del servidor",
+    });
   }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`🚀 Servidor ejecutándose en http://localhost:${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor ejecutándose en http://localhost:${PORT}`);
+});
