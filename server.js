@@ -1,4 +1,4 @@
-// server.js — Flujos Digitales (ESM) — anti-timeout + /health + /public
+// server.js — Flujos Digitales (ESM) — anti-timeout + /health + /public + Flow Webhook auto-registro
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Resend } from "resend";
+import axios from "axios";
 
 dotenv.config();
 const app = express();
@@ -13,7 +14,7 @@ app.set("trust proxy", 1);
 app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
 
-// ---------- Rutas/paths base ----------
+// ---------- Paths base ----------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 10000;
@@ -27,11 +28,10 @@ app.get("/healthz", (req, res) => {
 });
 
 // ---------- Servir estáticos desde /public ----------
-// Con esto, todo lo que esté en /public se sirve en la raíz,
-// ejemplo: public/Ebook-1_C.pdf -> https://TU-SERVICIO/Ebook-1_C.pdf
+// public/Ebook-1_C.pdf -> https://flujosdigitales-api.onrender.com/Ebook-1_C.pdf
 app.use(express.static(path.join(__dirname, "public"), { etag: true, maxAge: "1h" }));
 
-// Página raíz sencilla (opcional)
+// Página raíz
 app.get("/", (req, res) => {
   res.status(200).send("✅ API Flujos Digitales activa.");
 });
@@ -87,6 +87,7 @@ async function processEmail(jobId) {
       return;
     } catch (err) {
       lastErr = err;
+      console.warn(`[email] intento ${attempt}/${MAX_RETRIES} falló: ${err.message}`);
       await sleep(500 * Math.pow(2, attempt - 1)); // 500ms, 1s, 2s
     }
   }
@@ -94,7 +95,7 @@ async function processEmail(jobId) {
   job.error = lastErr?.message || "Fallo desconocido enviando correo";
 }
 
-// Endpoint opcional para revisar un job
+// ---------- Consultar estado de job (debug opcional) ----------
 app.get("/jobs/:id", (req, res) => {
   const job = emailJobs[req.params.id];
   if (!job) return res.status(404).json({ ok: false, error: "Job no encontrado" });
@@ -102,7 +103,7 @@ app.get("/jobs/:id", (req, res) => {
 });
 
 // ---------- Webhook de Flow ----------
-// Responde 200 de inmediato para evitar timeouts; el email se envía en background.
+// Recibe notificación de pago y dispara el envío del eBook
 app.post("/webhook/flow", async (req, res) => {
   try {
     const { email, paid, orderId, secret } = req.body || {};
@@ -131,9 +132,32 @@ app.post("/webhook/flow", async (req, res) => {
   }
 });
 
-// ---------- Levantar servidor + timeouts ----------
-const server = app.listen(PORT, () => {
-  console.log(`🚀 API corriendo en http://localhost:${PORT}`);
+// ---------- Registrar webhook automáticamente en Flow ----------
+// Solo necesitas ejecutarlo 1 vez: /setup-webhook
+app.get("/setup-webhook", async (req, res) => {
+  try {
+    const response = await axios.post(
+      "https://www.flow.cl/api/webhook/create",
+      {
+        apiKey: process.env.FLOW_API_KEY,
+        secretKey: process.env.FLOW_SECRET_KEY,
+        url: "https://flujosdigitales-api.onrender.com/webhook/flow",
+        events: ["payment.success"], // evento que Flow dispara tras pago exitoso
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    console.log("✅ Webhook registrado en Flow:", response.data);
+    res.status(200).json({ ok: true, response: response.data });
+  } catch (err) {
+    console.error("❌ Error registrando webhook:", err.response?.data || err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
-server.requestTimeout = 0;          // no cortar requests desde Node
-server.headersTimeout = 120000;     // 120s para handshake de headers
+
+// ---------- Levantar servidor ----------
+const server = app.listen(PORT, () => {
+  console.log(`🚀 API Flujos Digitales corriendo en http://localhost:${PORT}`);
+});
+server.requestTimeout = 0;
+server.headersTimeout = 120000;
