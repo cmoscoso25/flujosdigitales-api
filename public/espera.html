@@ -1,1 +1,116 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gracias por tu compra | Flujos Digitales</title>
+  <meta name="robots" content="noindex,nofollow" />
+  <style>
+    :root{--bg:#0f172a;--card:#111827;--muted:#cbd5e1;--text:#e2e8f0;--line:#1f2937;--btn:#2563eb;--okbg:#052e16;--okbd:#14532d;--oktx:#d1fae5;--erbg:#3f1d1d;--erbd:#7f1d1d;--ertx:#fecaca}
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:560px;width:100%;padding:28px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    h1{margin:0 0 10px;font-size:22px}
+    p{margin:8px 0 14px;line-height:1.55;color:var(--muted)}
+    .row{display:flex;gap:10px;margin:8px 0}
+    input,button{width:100%;padding:12px 14px;border-radius:10px;border:1px solid #334155;background:#0b1220;color:var(--text)}
+    input::placeholder{color:#64748b}
+    button{background:var(--btn);border-color:var(--btn);cursor:pointer;font-weight:600}
+    button[disabled]{opacity:.65;cursor:not-allowed}
+    .hint{font-size:12px;color:#94a3b8}
+    .ok{background:var(--okbg);border:1px solid var(--okbd);color:var(--oktx);padding:10px 12px;border-radius:10px;margin-top:12px}
+    .err{background:var(--erbg);border:1px solid var(--erbd);color:var(--ertx);padding:10px 12px;border-radius:10px;margin-top:12px;white-space:pre-wrap}
+    .hidden{display:none}
+    .center{text-align:center}
+    a.btn{display:inline-block;margin-top:10px;padding:10px 14px;background:#16a34a;color:white;text-decoration:none;border-radius:10px}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>¡Gracias por tu compra!</h1>
+    <p>Estamos procesando tu eBook. Si no se envió automáticamente, ingresa tu correo y lo recibirás al instante.</p>
+
+    <form id="f" class="form" autocomplete="email">
+      <div class="row">
+        <input id="email" type="email" placeholder="tu@correo.com" required />
+      </div>
+      <div class="row">
+        <input id="order" type="text" placeholder="Número de orden (opcional)" />
+      </div>
+      <button id="send">Enviar eBook a mi correo</button>
+      <p class="hint">Si vienes desde Flow y tu correo no aparece, escríbelo y presiona el botón.</p>
+    </form>
+
+    <div id="ok" class="ok hidden">¡Listo! Revisa tu correo (puede tardar unos segundos).</div>
+    <div id="err" class="err hidden"></div>
+
+    <div class="center">
+      <!-- Respaldo por si el correo tarda -->
+      <a id="backup" class="btn" href="https://flujosdigitales-api.onrender.com/Ebook-1_C.pdf" download>Descargar ahora</a>
+    </div>
+  </main>
+
+  <script>
+    // Tu API en Render
+    const API_BASE = "https://flujosdigitales-api.onrender.com";
+
+    const $ = (id)=>document.getElementById(id);
+    const email = $("email");
+    const order = $("order");
+    const f = $("f");
+    const ok = $("ok");
+    const err = $("err");
+    const sendBtn = $("send");
+
+    // Lee ?email=&order= si Flow los llegara a agregar
+    const q = new URLSearchParams(location.search);
+    if (q.get("email")) email.value = q.get("email");
+    if (q.get("order")) order.value = q.get("order");
+
+    // Disparo automático si viene con email en la URL (una sola vez)
+    window.addEventListener("load", async () => {
+      if (email.value && !sessionStorage.getItem("autofired")) {
+        sessionStorage.setItem("autofired","1");
+        await send();
+      }
+    });
+
+    f.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await send();
+    });
+
+    async function send(){
+      err.classList.add("hidden");
+      ok.classList.add("hidden");
+      sendBtn.disabled = true; sendBtn.textContent = "Enviando…";
+
+      const payload = {
+        paid: true,
+        email: (email.value || "").trim(),
+        orderId: (order.value || "").trim() || `web-${Date.now()}`
+      };
+
+      try{
+        const r = await fetch(`${API_BASE}/webhook/flow`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await r.json().catch(()=>({}));
+
+        if(!r.ok || !data.ok){
+          throw new Error(data?.message || "No pudimos procesar el envío.");
+        }
+        ok.classList.remove("hidden");
+      }catch(e){
+        err.textContent = e.message || "Error desconocido";
+        err.classList.remove("hidden");
+      }finally{
+        sendBtn.disabled = false; sendBtn.textContent = "Enviar eBook a mi correo";
+      }
+    }
+  </script>
+</body>
+</html>
 
