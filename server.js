@@ -1,4 +1,4 @@
-// server.js — Flujos Digitales (ESM) — anti-timeout + /health + /public + Flow Webhook auto-registro
+// server.js — Flujos Digitales (ESM) — sin axios (usa fetch nativo)
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -6,7 +6,6 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Resend } from "resend";
-import axios from "axios";
 
 dotenv.config();
 const app = express();
@@ -132,25 +131,33 @@ app.post("/webhook/flow", async (req, res) => {
   }
 });
 
-// ---------- Registrar webhook automáticamente en Flow ----------
-// Solo necesitas ejecutarlo 1 vez: /setup-webhook
+// ---------- Registrar webhook automáticamente en Flow (sin axios) ----------
+// Ejecuta 1 vez: GET /setup-webhook
 app.get("/setup-webhook", async (req, res) => {
   try {
-    const response = await axios.post(
-      "https://www.flow.cl/api/webhook/create",
-      {
-        apiKey: process.env.FLOW_API_KEY,
-        secretKey: process.env.FLOW_SECRET_KEY,
-        url: "https://flujosdigitales-api.onrender.com/webhook/flow",
-        events: ["payment.success"], // evento que Flow dispara tras pago exitoso
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
+    const payload = {
+      apiKey: process.env.FLOW_API_KEY,
+      secretKey: process.env.FLOW_SECRET_KEY,
+      url: "https://flujosdigitales-api.onrender.com/webhook/flow",
+      events: ["payment.success"], // evento tras pago exitoso
+    };
 
-    console.log("✅ Webhook registrado en Flow:", response.data);
-    res.status(200).json({ ok: true, response: response.data });
+    const resp = await fetch("https://www.flow.cl/api/webhook/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`Flow respondió ${resp.status}: ${txt}`);
+    }
+
+    const data = await resp.json().catch(() => ({}));
+    console.log("✅ Webhook registrado en Flow:", data);
+    res.status(200).json({ ok: true, response: data });
   } catch (err) {
-    console.error("❌ Error registrando webhook:", err.response?.data || err.message);
+    console.error("❌ Error registrando webhook:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
