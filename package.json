@@ -1,24 +1,26 @@
 {
-  "name": "flujosdigitales-api",
+  "name": "flujosdigitales-webhook",
   "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18 <=22"
+  },
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18.17.0"
-  },
   "dependencies": {
-    "express": "^4.19.2",
-    "dotenv": "^16.4.5",
-    "cors": "^2.8.5",
-    "body-parser": "^1.20.2",
-    "uuid": "^9.0.1",
-    "resend": "^3.2.0",
-    "nodemailer": "^6.9.13"
-  }
+    "dotenv": "16.4.5",
+    "express": "4.19.2",
+    "helmet": "7.1.0",
+    "morgan": "1.10.0",
+    "nodemailer": "6.9.14"
+  },
+  "description": "Servidor automatizado con webhook de Flow para envío automático de eBook por correo",
+  "author": "Flujos Digitales",
+  "license": "MIT"
 }
+
 
 
 
