@@ -3,11 +3,12 @@
  *
  * Endpoints:
  *  - GET  /health
- *  - POST /flow/confirm           { token }               -> confirma pago en Flow y envía eBook
- *  - POST /track-click            { token }               -> guarda token por IP+UA (respaldo)
- *  - POST /flow/confirm-no-token  (sin body)              -> usa último token trackeado para este cliente
+ *  - POST /flow/create            { amount?, email?, subject? } -> crea pago en Flow y retorna {token,url}
+ *  - POST /flow/confirm           { token }                     -> confirma pago y envía eBook
+ *  - POST /track-click            { token }                     -> opcional: guarda token por IP+UA
+ *  - POST /flow/confirm-no-token  (sin body)                    -> usa último token trackeado
  *
- * Requiere variables de entorno en Render:
+ * Variables de entorno (Render → Environment):
  *  PORT=10000
  *  RESEND_API_KEY=...
  *  MAIL_FROM=Flujos Digitales <no-reply@flujosdigitales.com>
@@ -53,25 +54,26 @@ const EBOOK_PATH_ASSETS = path.join(ASSETS_DIR, EBOOK_FILENAME);
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(cors());
-
-// Servir estáticos desde /public (por si necesitas exponer el PDF)
 app.use(express.static(PUBLIC_DIR, { maxAge: "1h", index: false }));
 
 // ──────────────────────────────────────────────────────────────
-// Utilidades
+// Utils
 // ──────────────────────────────────────────────────────────────
-
-/** Firma HMAC-SHA256 para Flow (concatenación key=val ordenada por clave) */
-function flowSign(params) {
+function sortAndConcat(params) {
   const keys = Object.keys(params).sort();
-  const baseStr = keys.map(k => `${k}=${params[k]}`).join("&");
+  return keys.map(k => `${k}=${params[k]}`).join("&");
+}
+
+/** Firma HMAC-SHA256 para Flow */
+function flowSign(params) {
+  if (!FLOW_SECRET_KEY) throw new Error("Missing FLOW_SECRET_KEY");
+  const baseStr = sortAndConcat(params);
   return crypto.createHmac("sha256", FLOW_SECRET_KEY).update(baseStr).digest("hex");
 }
 
-/** Consulta estado de pago en Flow por token */
+/** Consultar estado por token de transacción */
 async function fetchFlowPaymentByToken(token) {
-  // Documentación habitual de Flow: /api/payment/getStatus?token&apiKey&s
-  // Algunos comercios usan /payment/getStatus; este endpoint retorna JSON.
+  if (!FLOW_API_KEY) throw new Error("Missing FLOW_API_KEY");
   const params = { apiKey: FLOW_API_KEY, token };
   const s = flowSign(params);
   const qs = new URLSearchParams({ ...params, s }).toString();
@@ -86,13 +88,8 @@ async function fetchFlowPaymentByToken(token) {
   return data;
 }
 
-/** Normaliza la respuesta de Flow a { email, orderId, isPaid } */
+/** Normalizar respuesta Flow → { email, orderId, isPaid } */
 function normalizeFlowResponse(flowJson) {
-  // Campos típicos de Flow:
-  // - status: 1 (pendiente), 2 (pagado), 3 (rechazado), 4 (anulado)
-  // - payer: { email: ... }   (según integración)
-  // - email?    (depende)
-  // - commerceOrder / orderId / flowOrder ?  (según integración)
   const status = Number(flowJson.status || 0);
   const isPaid = status === 2;
 
@@ -111,19 +108,15 @@ function normalizeFlowResponse(flowJson) {
   return { email: payerEmail, orderId, isPaid };
 }
 
-/** Envía el eBook usando Resend (con adjunto) */
+/** Enviar eBook por Resend (adjunto) */
 async function sendEbook({ email, orderId }) {
   if (!RESEND_API_KEY) throw new Error("Missing RESEND_API_KEY");
   if (!email) throw new Error("Missing recipient email");
 
-  // Resolver archivo (puede estar en /public o /assets)
   let filePath = null;
   if (fs.existsSync(EBOOK_PATH_PUBLIC)) filePath = EBOOK_PATH_PUBLIC;
   else if (fs.existsSync(EBOOK_PATH_ASSETS)) filePath = EBOOK_PATH_ASSETS;
-
-  if (!filePath) {
-    throw new Error(`Ebook file not found: ${EBOOK_FILENAME} in /public or /assets`);
-  }
+  if (!filePath) throw new Error(`Ebook file not found: ${EBOOK_FILENAME} in /public or /assets`);
 
   const pdfBuffer = fs.readFileSync(filePath);
   const encoded = pdfBuffer.toString("base64");
@@ -133,7 +126,7 @@ async function sendEbook({ email, orderId }) {
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
       <p>Hola 👋</p>
       <p>¡Gracias por tu compra! Adjuntamos tu eBook en PDF.</p>
-      <p>Si necesitas apoyo, escríbenos respondiendo este correo.</p>
+      <p>Si no lo ves, revisa tu carpeta de spam/promociones.</p>
       <hr />
       <p style="font-size:12px;color:#64748b">Orden: ${orderId || "-"}</p>
     </div>
@@ -151,10 +144,7 @@ async function sendEbook({ email, orderId }) {
       subject,
       html,
       attachments: [
-        {
-          filename: EBOOK_FILENAME,
-          content: encoded
-        }
+        { filename: EBOOK_FILENAME, content: encoded }
       ]
     })
   });
@@ -163,17 +153,13 @@ async function sendEbook({ email, orderId }) {
     const txt = await resp.text().catch(() => "");
     throw new Error(`Resend failed ${resp.status}: ${txt}`);
   }
-  const data = await resp.json().catch(() => ({}));
-  return data;
+  return await resp.json().catch(() => ({}));
 }
 
-/** Ruta de salud */
-app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+/** Salud */
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ──────────────────────────────────────────────────────────────
-// Seguridad mínima: validar header desde el front
+/** Seguridad mínima para callbacks desde front */
 function requireClientSecret(req, res) {
   const header = (req.headers["x-client-secret"] || "").toString();
   if (!CLIENT_CALLBACK_SECRET || header !== CLIENT_CALLBACK_SECRET) {
@@ -183,7 +169,7 @@ function requireClientSecret(req, res) {
   return true;
 }
 
-// Persistencia de orden (idempotencia)
+/** Idempotencia: archivo por orderId */
 function isOrderProcessed(orderId) {
   const file = path.join(ORDERS_DIR, `${orderId}.json`);
   return fs.existsSync(file);
@@ -193,9 +179,73 @@ function markOrderProcessed(orderId, payload) {
   fs.writeFileSync(file, JSON.stringify(payload, null, 2), "utf8");
 }
 
+/** Identificador del cliente (IP+UA) para track de token opcional */
+function clientKey(req) {
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
+  const ua = (req.headers["user-agent"] || "").toString();
+  return crypto.createHash("sha256").update(ip + "|" + ua).digest("hex");
+}
+
 // ──────────────────────────────────────────────────────────────
-// Confirmación principal con token
-// Body: { token }
+// Crear pago por API → devuelve token + URL oficial de Flow
+// ──────────────────────────────────────────────────────────────
+app.post("/flow/create", async (req, res) => {
+  try {
+    if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
+      return res.status(500).json({ ok: false, error: "missing_flow_keys" });
+    }
+
+    const {
+      amount = 350, // CLP (para pruebas)
+      email = "",   // opcional (sugerido)
+      subject = "Ebook – 100 Prompts PYMES"
+    } = req.body || {};
+
+    const commerceOrder = "web-" + Date.now();
+    const successUrl = `https://flujosdigitales.com/gracias.html?token={token}`;
+    const failureUrl = `https://flujosdigitales.com/gracias.html?error=payment_failed`;
+
+    const params = {
+      apiKey: FLOW_API_KEY,
+      subject,
+      amount,
+      currency: "CLP",
+      commerceOrder,
+      email,                   // opcional
+      paymentMethod: 9,        // 9 = Webpay (opcional)
+      urlConfirmation: "",     // sin webhook
+      urlReturn: successUrl,   // Flow redirige con {token}
+      urlCancel: failureUrl
+    };
+
+    const s = flowSign(params);
+    const body = new URLSearchParams({ ...params, s }).toString();
+
+    const r = await fetch("https://www.flow.cl/api/payment/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      return res.status(502).json({ ok: false, error: `flow_create_failed_${r.status}`, detail: txt });
+    }
+    const data = await r.json();
+
+    const token = data.token;
+    const url = data.url || `https://www.flow.cl/app/web/pay.php?token=${token}`;
+    return res.json({ ok: true, token, url, commerceOrder });
+
+  } catch (e) {
+    console.error("flow/create error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// Confirmación principal con token de transacción
+// ──────────────────────────────────────────────────────────────
 app.post("/flow/confirm", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
@@ -235,13 +285,8 @@ app.post("/flow/confirm", async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// Tracking de clic (respaldo de token), guarda por IP+UA
-function clientKey(req) {
-  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
-  const ua = (req.headers["user-agent"] || "").toString();
-  return crypto.createHash("sha256").update(ip + "|" + ua).digest("hex");
-}
-
+// Opcional: tracking del clic (no requerido con /flow/create, pero lo dejamos)
+// ──────────────────────────────────────────────────────────────
 app.post("/track-click", (req, res) => {
   try {
     const { token } = req.body || {};
@@ -258,7 +303,8 @@ app.post("/track-click", (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// Confirmación de respaldo sin token
+// Confirmación de respaldo sin token (usa último trackeado por IP+UA)
+// ──────────────────────────────────────────────────────────────
 app.post("/flow/confirm-no-token", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
@@ -270,7 +316,6 @@ app.post("/flow/confirm-no-token", async (req, res) => {
     }
 
     const { token, ts } = JSON.parse(fs.readFileSync(file, "utf8"));
-    // caduca en 15 minutos
     if (!token || Date.now() - ts > 15 * 60 * 1000) {
       return res.status(410).json({ ok: false, error: "tracked_token_expired" });
     }
