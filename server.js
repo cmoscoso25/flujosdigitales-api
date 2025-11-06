@@ -215,7 +215,7 @@ app.post("/flow/create", async (req, res) => {
       currency: "CLP",
       commerceOrder,
       userEmail: email,
-      paymentMethod: 9,
+      // paymentMethod: 9,
       urlConfirmation: confirmationUrl,
       urlReturn: successUrl,
       urlCancel: failureUrl
@@ -224,10 +224,11 @@ app.post("/flow/create", async (req, res) => {
     const s = flowSign(params);
     const encoded = new URLSearchParams({ ...params, s }).toString();
 
-    const r = await fetch("https://www.flow.cl/api/payment/create", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: encoded
+    const r = await fetch("https://www.flow.cl/api/payment/create", { ... });
+
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        return res.status(502).json({ ok: false, error: `flow_create_failed_${r.status}`, detail: txt });
     });
 
     if (!r.ok) {
