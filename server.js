@@ -1,33 +1,13 @@
 /**
- * server.js — Flujos Digitales (Render)
- *
- * Endpoints:
- *  - GET  /health
- *  - POST /flow/create            { amount?, email?, subject? } -> crea pago en Flow y retorna {token,url}
- *  - POST /flow/confirm           { token }                     -> confirma pago y envía eBook
- *  - POST /track-click            { token }                     -> opcional: guarda token por IP+UA
- *  - POST /flow/confirm-no-token  (sin body)                    -> usa último token trackeado
- *
- * Variables de entorno (Render → Environment):
- *  PORT=10000
- *  RESEND_API_KEY=...
- *  MAIL_FROM=Flujos Digitales <no-reply@flujosdigitales.com>
- *  FLOW_API_KEY=...
- *  FLOW_SECRET_KEY=...
- *  CLIENT_CALLBACK_SECRET=FlujosDigitales2025_93bL5x0GzPz8m4q1
- *  DOMAIN=https://flujosdigitales-api.onrender.com
- *  EBOOK_FILENAME=Ebook-1_C.pdf
+ * server.js — Flujos Digitales (Render) [CORS robusto + URL-encoded]
+ * (Archivo completo listo para Render)
  */
-
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 
-// ──────────────────────────────────────────────────────────────
-// Config
-// ──────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT || 10000);
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const MAIL_FROM = process.env.MAIL_FROM || "Flujos Digitales <no-reply@flujosdigitales.com>";
@@ -50,28 +30,43 @@ for (const dir of [PUBLIC_DIR, ASSETS_DIR, ORDERS_DIR, PENDING_DIR]) {
 const EBOOK_PATH_PUBLIC = path.join(PUBLIC_DIR, EBOOK_FILENAME);
 const EBOOK_PATH_ASSETS = path.join(ASSETS_DIR, EBOOK_FILENAME);
 
-// ──────────────────────────────────────────────────────────────
 const app = express();
+
+// CORS robusto + parsers
+app.set("trust proxy", 1);
+const allowedOrigins = [
+  "https://flujosdigitales.com",
+  "https://www.flujosdigitales.com",
+  "http://localhost:5173",
+  "http://localhost:3000"
+];
+const corsOptions = {
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);
+    return cb(null, allowedOrigins.includes(origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Secret"],
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json({ limit: "2mb" }));
-app.use(cors());
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(PUBLIC_DIR, { maxAge: "1h", index: false }));
 
-// ──────────────────────────────────────────────────────────────
-// Utils
-// ──────────────────────────────────────────────────────────────
 function sortAndConcat(params) {
   const keys = Object.keys(params).sort();
   return keys.map(k => `${k}=${params[k]}`).join("&");
 }
 
-/** Firma HMAC-SHA256 para Flow */
 function flowSign(params) {
   if (!FLOW_SECRET_KEY) throw new Error("Missing FLOW_SECRET_KEY");
   const baseStr = sortAndConcat(params);
   return crypto.createHmac("sha256", FLOW_SECRET_KEY).update(baseStr).digest("hex");
 }
 
-/** Consultar estado por token de transacción */
 async function fetchFlowPaymentByToken(token) {
   if (!FLOW_API_KEY) throw new Error("Missing FLOW_API_KEY");
   const params = { apiKey: FLOW_API_KEY, token };
@@ -88,27 +83,22 @@ async function fetchFlowPaymentByToken(token) {
   return data;
 }
 
-/** Normalizar respuesta Flow → { email, orderId, isPaid } */
 function normalizeFlowResponse(flowJson) {
   const status = Number(flowJson.status || 0);
   const isPaid = status === 2;
-
   const payerEmail =
     (flowJson.payer && flowJson.payer.email) ||
     flowJson.email ||
     (flowJson.customer && flowJson.customer.email) ||
     null;
-
   const orderId =
     flowJson.commerceOrder ||
     flowJson.orderId ||
     flowJson.flowOrder ||
     null;
-
   return { email: payerEmail, orderId, isPaid };
 }
 
-/** Enviar eBook por Resend (adjunto) */
 async function sendEbook({ email, orderId }) {
   if (!RESEND_API_KEY) throw new Error("Missing RESEND_API_KEY");
   if (!email) throw new Error("Missing recipient email");
@@ -156,10 +146,9 @@ async function sendEbook({ email, orderId }) {
   return await resp.json().catch(() => ({}));
 }
 
-/** Salud */
+// Health
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-/** Seguridad mínima para callbacks desde front */
 function requireClientSecret(req, res) {
   const header = (req.headers["x-client-secret"] || "").toString();
   if (!CLIENT_CALLBACK_SECRET || header !== CLIENT_CALLBACK_SECRET) {
@@ -169,7 +158,6 @@ function requireClientSecret(req, res) {
   return true;
 }
 
-/** Idempotencia: archivo por orderId */
 function isOrderProcessed(orderId) {
   const file = path.join(ORDERS_DIR, `${orderId}.json`);
   return fs.existsSync(file);
@@ -179,27 +167,23 @@ function markOrderProcessed(orderId, payload) {
   fs.writeFileSync(file, JSON.stringify(payload, null, 2), "utf8");
 }
 
-/** Identificador del cliente (IP+UA) para track de token opcional */
 function clientKey(req) {
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
   const ua = (req.headers["user-agent"] || "").toString();
   return crypto.createHash("sha256").update(ip + "|" + ua).digest("hex");
 }
 
-// ──────────────────────────────────────────────────────────────
-// Crear pago por API → devuelve token + URL oficial de Flow
-// ──────────────────────────────────────────────────────────────
+// Crear pago
 app.post("/flow/create", async (req, res) => {
   try {
     if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
       return res.status(500).json({ ok: false, error: "missing_flow_keys" });
     }
 
-    const {
-      amount = 350, // CLP (para pruebas)
-      email = "",   // opcional (sugerido)
-      subject = "Ebook – 100 Prompts PYMES"
-    } = req.body || {};
+    const body = req.body || {};
+    const amount = Number(body.amount || 350); // CLP pruebas
+    const email = (body.email || "").toString();
+    const subject = (body.subject || "Ebook – 100 Prompts PYMES").toString();
 
     const commerceOrder = "web-" + Date.now();
     const successUrl = `https://flujosdigitales.com/gracias.html?token={token}`;
@@ -211,20 +195,20 @@ app.post("/flow/create", async (req, res) => {
       amount,
       currency: "CLP",
       commerceOrder,
-      email,                   // opcional
-      paymentMethod: 9,        // 9 = Webpay (opcional)
-      urlConfirmation: "",     // sin webhook
-      urlReturn: successUrl,   // Flow redirige con {token}
+      email,
+      paymentMethod: 9,
+      urlConfirmation: "",
+      urlReturn: successUrl,
       urlCancel: failureUrl
     };
 
     const s = flowSign(params);
-    const body = new URLSearchParams({ ...params, s }).toString();
+    const encoded = new URLSearchParams({ ...params, s }).toString();
 
     const r = await fetch("https://www.flow.cl/api/payment/create", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body
+      body: encoded
     });
 
     if (!r.ok) {
@@ -232,7 +216,6 @@ app.post("/flow/create", async (req, res) => {
       return res.status(502).json({ ok: false, error: `flow_create_failed_${r.status}`, detail: txt });
     }
     const data = await r.json();
-
     const token = data.token;
     const url = data.url || `https://www.flow.cl/app/web/pay.php?token=${token}`;
     return res.json({ ok: true, token, url, commerceOrder });
@@ -243,9 +226,7 @@ app.post("/flow/create", async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
-// Confirmación principal con token de transacción
-// ──────────────────────────────────────────────────────────────
+// Confirmar con token
 app.post("/flow/confirm", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
@@ -284,9 +265,7 @@ app.post("/flow/confirm", async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
-// Opcional: tracking del clic (no requerido con /flow/create, pero lo dejamos)
-// ──────────────────────────────────────────────────────────────
+// Track click (opcional)
 app.post("/track-click", (req, res) => {
   try {
     const { token } = req.body || {};
@@ -302,9 +281,7 @@ app.post("/track-click", (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
-// Confirmación de respaldo sin token (usa último trackeado por IP+UA)
-// ──────────────────────────────────────────────────────────────
+// Confirmación sin token
 app.post("/flow/confirm-no-token", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
@@ -351,7 +328,6 @@ app.post("/flow/confirm-no-token", async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log("//////////////////////////////////////////////////////////");
   console.log(`🚀 API Flujos Digitales corriendo en http://localhost:${PORT}`);
