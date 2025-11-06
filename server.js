@@ -1,8 +1,8 @@
 /**
- * server.js — Flujos Digitales (Render) [versión estable]
+ * server.js — Flujos Digitales (Render) [versión estable sin userEmail]
  * - CORS
  * - Health checks
- * - Crear pago en Flow (firmado HMAC)
+ * - Crear pago en Flow (firmado HMAC) solo con `email`
  * - Webhook de Flow
  * - Confirmación de pago + envío de eBook por Resend
  */
@@ -70,7 +70,7 @@ app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Archivos estáticos (sin index para no pisar landing)
+// Archivos estáticos (sin index)
 app.use(express.static(PUBLIC_DIR, { maxAge: "1h", index: false }));
 
 // Health
@@ -166,7 +166,7 @@ async function sendEbook({ email, orderId }) {
   return await resp.json().catch(() => ({}));
 }
 
-// Auxiliares varios
+// Auxiliares
 function requireClientSecret(req, res) {
   const header = (req.headers["x-client-secret"] || "").toString();
   if (!CLIENT_CALLBACK_SECRET || header !== CLIENT_CALLBACK_SECRET) {
@@ -190,7 +190,7 @@ function clientKey(req) {
 }
 
 // ──────────────────────────────
-// 💳 Crear pago Flow
+// 💳 Crear pago Flow (SIN userEmail)
 // ──────────────────────────────
 app.post("/flow/create", async (req, res) => {
   try {
@@ -200,7 +200,7 @@ app.post("/flow/create", async (req, res) => {
 
     const body = req.body || {};
     const amount = Number(body.amount || 9990);
-    const email  = (body.email  || "").toString().trim();
+    const email  = ((body.email || "") + "").trim().toLowerCase();
     const subject = (body.subject || "Ebook – 100 Prompts PYMES").toString();
 
     // URLs públicas para Flow
@@ -221,12 +221,12 @@ app.post("/flow/create", async (req, res) => {
       amount,
       currency: "CLP",
       commerceOrder,
-      userEmail: email,      // requerido por Flow
-      email,                 // algunos comercios lo requieren también
+      // ⚠️ SOLO email (eliminado userEmail)
+      email,
       urlConfirmation: confirmationUrl,
       urlReturn: successUrl,
       urlCancel: failureUrl
-      // paymentMethod: 1,    // opcional (Webpay). Dejar comentado si da 400.
+      // paymentMethod: 1, // opcional
     };
 
     // Firmar y enviar como x-www-form-urlencoded
@@ -259,9 +259,8 @@ app.post("/flow/create", async (req, res) => {
 });
 
 // ──────────────────────────────
-/** ✅ Webhook de Flow
- *  Flow solo necesita 200 OK. Aquí podrías validar firma y persistir.
- */
+// ✅ Webhook (solo 200 OK)
+// ──────────────────────────────
 app.post("/webhook/flow", express.urlencoded({ extended: true }), (req, res) => {
   try {
     console.log("Flow webhook recibido:", req.body);
@@ -305,7 +304,6 @@ app.post("/flow/confirm", async (req, res) => {
 
 // ──────────────────────────────
 // 🧩 Track click (opcional)
-// ──────────────────────────────
 app.post("/track-click", (req, res) => {
   try {
     const { token } = req.body || {};
@@ -322,7 +320,6 @@ app.post("/track-click", (req, res) => {
 
 // ──────────────────────────────
 // 🔁 Confirmar sin token (opcional)
-// ──────────────────────────────
 app.post("/flow/confirm-no-token", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
