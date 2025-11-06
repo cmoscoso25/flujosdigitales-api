@@ -53,16 +53,18 @@ app.post("/flow/create", async (req, res) => {
 
     // --- Parámetros obligatorios de Flow ---
     const params = {
-      apiKey: FLOW_API_KEY,
-      subject,
-      currency: "CLP",
-      amount: amount.toString(),
-      commerceOrder: `web-${Date.now()}`,
-      email, // ✅ AHORA se incluye el email correctamente
-      urlConfirmation: confirmationUrl,
-      urlReturn: successUrl,
-      urlCancel: failureUrl
-    };
+  apiKey: FLOW_API_KEY,
+  subject: "Ebook Flujos Digitales",
+  amount,
+  currency: "CLP",
+  commerceOrder: `order-${Date.now()}`,
+  email: email,               // <--- aquí el cambio
+  paymentMethod: 9,
+  urlConfirmation: confirmationUrl,
+  urlReturn: successUrl,
+  urlCancel: failureUrl
+};
+
 
     // --- Firma HMAC SHA256 ---
     const ordered = Object.keys(params)
