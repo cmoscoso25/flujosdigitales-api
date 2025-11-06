@@ -214,7 +214,7 @@ app.post("/flow/create", async (req, res) => {
       amount,
       currency: "CLP",
       commerceOrder,
-      email,
+      userEmail,
       paymentMethod: 9,
       urlConfirmation: confirmationUrl,
       urlReturn: successUrl,
