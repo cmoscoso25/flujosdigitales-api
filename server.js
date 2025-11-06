@@ -1,5 +1,5 @@
 /**
- * server.js — Flujos Digitales (Render) [versión final]
+ * server.js — Flujos Digitales (Render) [versión final con webhook]
  * Totalmente funcional en Render, con CORS, health check y soporte Flow.
  */
 
@@ -15,7 +15,10 @@ const MAIL_FROM = process.env.MAIL_FROM || "Flujos Digitales <no-reply@flujosdig
 const FLOW_API_KEY = process.env.FLOW_API_KEY;
 const FLOW_SECRET_KEY = process.env.FLOW_SECRET_KEY;
 const CLIENT_CALLBACK_SECRET = process.env.CLIENT_CALLBACK_SECRET;
+
+// ⚠️ IMPORTANTE: en Render define DOMAIN=https://flujosdigitales-api.onrender.com
 const DOMAIN = process.env.DOMAIN || `http://localhost:${PORT}`;
+
 const EBOOK_FILENAME = process.env.EBOOK_FILENAME || "Ebook-1_C.pdf";
 
 const __DIR = process.cwd();
@@ -198,9 +201,13 @@ app.post("/flow/create", async (req, res) => {
     const subject = (body.subject || "Ebook – 100 Prompts PYMES").toString();
 
     const commerceOrder = "web-" + Date.now();
+
+    // ✅ URLs para Flow
     const successUrl = `https://flujosdigitales.com/gracias.html?token={token}`;
     const failureUrl = `https://flujosdigitales.com/gracias.html?error=payment_failed`;
+    const confirmationUrl = `${DOMAIN}/webhook/flow`; // <<— URL válida para notificación
 
+    // ✅ Parámetros para crear el pago en Flow (urlConfirmation ya no está vacío)
     const params = {
       apiKey: FLOW_API_KEY,
       subject,
@@ -209,7 +216,7 @@ app.post("/flow/create", async (req, res) => {
       commerceOrder,
       email,
       paymentMethod: 9,
-      urlConfirmation: "",
+      urlConfirmation: confirmationUrl,
       urlReturn: successUrl,
       urlCancel: failureUrl
     };
@@ -239,7 +246,22 @@ app.post("/flow/create", async (req, res) => {
 });
 
 // ──────────────────────────────
-// ✅ Confirmar pago
+// ✅ Webhook de confirmación de Flow (ACK 200)
+// ──────────────────────────────
+app.post("/webhook/flow", express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    console.log("Flow webhook recibido:", req.body);
+    // Aquí podrías validar firma y actualizar estado si quisieras.
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("Error en webhook Flow:", err);
+    // Flow espera 200; devolvemos OK igual para evitar reintentos infinitos.
+    res.status(200).send("OK");
+  }
+});
+
+// ──────────────────────────────
+// ✅ Confirmar pago (vía token)
 // ──────────────────────────────
 app.post("/flow/confirm", async (req, res) => {
   try {
