@@ -13,7 +13,7 @@ const FLOW_SECRET_KEY = process.env.FLOW_SECRET_KEY;
 // IMPORTANTE: separar bases
 // API_BASE -> donde vive ESTE servidor (ej: https://flujosdigitales-api.onrender.com)
 // SITE_BASE -> tu landing estática (ej: https://flujosdigitales.com)
-const API_BASE  = (process.env.API_BASE  || "").replace(/\/+$/, "");
+const API_BASE  = (process.env.API_BASE || process.env.BASE_URL || "").replace(/\/+$/, "");
 const SITE_BASE = (process.env.SITE_BASE || "").replace(/\/+$/, "");
 
 // === Middlewares ===
