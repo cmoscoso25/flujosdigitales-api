@@ -4,7 +4,7 @@
 
 import express from "express";
 import cors from "cors";
-import morgan from "morgan";
+// import morgan from "morgan";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
@@ -23,7 +23,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-app.use(morgan(process.env.NODE_ENV === "production" ? "tiny" : "dev"));
+//app.use(morgan(process.env.NODE_ENV === "production" ? "tiny" : "dev"));
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 10000;
