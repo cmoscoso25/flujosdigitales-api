@@ -1,7 +1,16 @@
 // server.js — FlujosDigitales API (Render / Node 20+)
+//
+// Requisitos de ENV (Render -> Environment):
+// FLOW_API_KEY=xxxxxxxxxxxxxxxx
+// FLOW_SECRET_KEY=yyyyyyyyyyyyyy
+// BASE_URL=https://flujosdigitales-api.onrender.com     (o API_BASE)
+// SITE_BASE=https://flujosdigitales.com
+//
+// Nota: API_BASE usa fallback a BASE_URL.
 
 import express from "express";
 import crypto from "crypto";
+import cors from "cors";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -10,13 +19,30 @@ const PORT = process.env.PORT || 10000;
 const FLOW_API_KEY    = process.env.FLOW_API_KEY;
 const FLOW_SECRET_KEY = process.env.FLOW_SECRET_KEY;
 
-// IMPORTANTE: separar bases
-// API_BASE -> donde vive ESTE servidor (ej: https://flujosdigitales-api.onrender.com)
-// SITE_BASE -> tu landing estática (ej: https://flujosdigitales.com)
+// API_BASE -> donde vive ESTE servidor (Render)
+// SITE_BASE -> tu landing estática
 const API_BASE  = (process.env.API_BASE || process.env.BASE_URL || "").replace(/\/+$/, "");
 const SITE_BASE = (process.env.SITE_BASE || "").replace(/\/+$/, "");
 
-// === Middlewares ===
+// === CORS (permitir front) ===
+const ALLOWED_ORIGINS = [
+  "https://flujosdigitales.com",
+  "https://www.flujosdigitales.com",
+  // Agrega "http://localhost:5500" si pruebas landing local
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // curl/Postman
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Accept"],
+}));
+app.options("*", cors());
+
+// === Body parsers ===
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -25,10 +51,15 @@ function isValidEmail(email = "") {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
 }
 function toFormUrlEncoded(obj) {
-  return Object.entries(obj).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+  return Object.entries(obj)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
 }
 function signFlowParams(params, secret) {
-  const sorted = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join("&");
+  const sorted = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
   return crypto.createHmac("sha256", secret).update(sorted).digest("hex");
 }
 
@@ -47,27 +78,35 @@ app.post("/flow/create", async (req, res) => {
       return res.status(500).json({ ok: false, error: "missing_flow_keys" });
     }
     if (!API_BASE || !SITE_BASE) {
-      return res.status(500).json({ ok: false, error: "missing_base_urls", detail: { API_BASE, SITE_BASE } });
+      return res.status(500).json({
+        ok: false,
+        error: "missing_base_urls",
+        detail: { API_BASE, SITE_BASE },
+      });
     }
 
-    // 2) Parámetros
+    // 2) Parámetros de entrada
     const amountRaw = req.body?.amount ?? req.query?.amount;
     const email = String(req.body?.email ?? req.query?.email ?? "").trim();
 
     const amount = Number(amountRaw || 0);
     if (!amount || amount <= 0) {
-      return res.status(400).json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
     }
     if (!isValidEmail(email)) {
-      return res.status(400).json({ ok: false, error: "invalid_email", detail: { email } });
+      return res
+        .status(400)
+        .json({ ok: false, error: "invalid_email", detail: { email } });
     }
 
-    // 3) URLs (separadas)
-    const urlConfirmation = `${API_BASE}/webhook/flow`;                 // webhook S2S (debe existir aquí)
-    const urlReturn       = `${SITE_BASE}/gracias.html?token={token}`;  // vuelve el usuario a tu landing
+    // 3) URLs separadas
+    const urlConfirmation = `${API_BASE}/webhook/flow`;                 // Webhook server-to-server (vive aquí)
+    const urlReturn       = `${SITE_BASE}/gracias.html?token={token}`;  // Retorno visible al usuario
     const urlCancel       = `${SITE_BASE}/gracias.html?error=payment_failed`;
 
-    // 4) Parámetros Flow
+    // 4) Parámetros para Flow
     const params = {
       apiKey: FLOW_API_KEY,
       commerceOrder: `web-${Date.now()}`,
@@ -78,7 +117,7 @@ app.post("/flow/create", async (req, res) => {
       urlConfirmation,
       urlReturn,
       urlCancel,
-      // paymentMethod: 9, // descomenta para forzar Webpay
+      // paymentMethod: 9, // descomenta si quieres forzar Webpay
     };
 
     // 5) Firma
@@ -95,15 +134,31 @@ app.post("/flow/create", async (req, res) => {
       body: bodyEncoded,
     });
 
-    const txt = await r.text().catch(() => "");
-    let data; try { data = JSON.parse(txt); } catch { data = null; }
+    const text = await r.text().catch(() => "");
+    let data;
+    try { data = JSON.parse(text); } catch { data = null; }
 
     if (!r.ok) {
-      return res.status(502).json({ ok: false, error: `flow_create_failed_${r.status}`, detail: txt || null });
+      return res.status(502).json({
+        ok: false,
+        error: `flow_create_failed_${r.status}`,
+        detail: text || null,
+      });
     }
 
-    // Devuelve tal cual lo que responde Flow (incluye token/redirect)
-    return res.json({ ok: true, flow: data || txt || null });
+    // 7) Normalización de salida
+    const token = data?.token ?? data?.data?.token ?? null;
+    const url   = data?.url ?? (token ? `https://www.flow.cl/btn.php?token=${token}` : null);
+
+    if (!token || !url) {
+      return res.status(502).json({
+        ok: false,
+        error: "flow_create_unexpected_response",
+        detail: data || text || null,
+      });
+    }
+
+    return res.json({ ok: true, flow: { token, url } });
   } catch (err) {
     console.error("flow/create error:", err);
     return res.status(500).json({ ok: false, error: "server_error" });
