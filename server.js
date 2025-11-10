@@ -23,7 +23,7 @@ const FLOW_SECRET    = (process.env.FLOW_SECRET_KEY || "").trim();
 const API_BASE       = (process.env.API_BASE || process.env.BASE_URL || "").replace(/\/+$/, "");
 const SITE_BASE      = (process.env.SITE_BASE || "").replace(/\/+$/, "");
 
-// Host de Flow según ambiente (esto mata el 400 por mezcla sandbox/prod)
+// Host de Flow según ambiente (evita mezclar sandbox/prod)
 const FLOW_HOST = FLOW_ENV === "SANDBOX"
   ? "https://sandbox.flow.cl"
   : "https://www.flow.cl";
@@ -89,10 +89,10 @@ app.post("/flow/create", async (req, res) => {
   try {
     // Validaciones base
     if (!FLOW_API_KEY || !FLOW_SECRET) {
-      return res.status(500).json({ ok: false, error: "missing_flow_keys" });
+      return res.status(200).json({ ok: false, error: "missing_flow_keys" });
     }
     if (!API_BASE || !SITE_BASE) {
-      return res.status(500).json({ ok: false, error: "missing_base_urls", detail: { API_BASE, SITE_BASE } });
+      return res.status(200).json({ ok: false, error: "missing_base_urls", detail: { API_BASE, SITE_BASE } });
     }
 
     // Entrada
@@ -102,7 +102,7 @@ app.post("/flow/create", async (req, res) => {
 
     const amount = Number(amountRaw || 0);
     if (!amount || amount <= 0) {
-      return res.status(400).json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
+      return res.status(200).json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
     }
 
     // URLs
@@ -148,18 +148,19 @@ app.post("/flow/create", async (req, res) => {
     try { data = JSON.parse(text); } catch { /* Flow puede devolver texto plano */ }
 
     if (!r.ok) {
-      // Log lo que devolvió Flow para diagnosticar (visible en Render -> Logs)
+      // Log visible en Render -> Logs
       console.error("Flow create failed:", {
         status: r.status,
         endpoint: FLOW_CREATE_URL,
         env: FLOW_ENV,
-        responseText: text?.slice(0, 500)
+        responseText: text?.slice(0, 800)
       });
-      // devolvemos el detail para verlo en Network del navegador
-      return res.status(502).json({
+      // ⬇⬇⬇ cambio clave: devolvemos 200 para que el cliente vea el JSON de error
+      return res.status(200).json({
         ok: false,
         error: `flow_create_failed_${r.status}`,
         detail: data || text || null,
+        flow_status: r.status
       });
     }
 
@@ -168,14 +169,14 @@ app.post("/flow/create", async (req, res) => {
     const url   = data?.url ?? (token ? `https://www.flow.cl/btn.php?token=${token}` : null);
 
     if (!token || !url) {
-      console.error("Flow unexpected response:", { data, text: text?.slice(0, 500) });
-      return res.status(502).json({ ok: false, error: "flow_create_unexpected_response", detail: data || text || null });
+      console.error("Flow unexpected response:", { data, text: text?.slice(0, 800) });
+      return res.status(200).json({ ok: false, error: "flow_create_unexpected_response", detail: data || text || null });
     }
 
     return res.json({ ok: true, flow: { token, url }, meta: { commerceOrder, env: FLOW_ENV } });
   } catch (err) {
     console.error("flow/create error:", err);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(200).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -188,6 +189,24 @@ app.all("/webhook/flow", (req, res) => {
     ts: new Date().toISOString(),
   });
   res.status(200).send("OK");
+});
+
+// === Alias GET para depurar desde el navegador ===
+// Permite: https://flujosdigitales-api.onrender.com/flow/create?amount=9990&email=tu@correo.cl
+app.get("/flow/create", async (req, res) => {
+  try {
+    const body = new URLSearchParams(req.query).toString();
+    const r = await fetch(`${API_BASE}/flow/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
+      body
+    });
+    const text = await r.text();
+    res.status(200).type("application/json").send(text);
+  } catch (e) {
+    console.error("GET alias error:", e);
+    res.status(200).json({ ok: false, error: "alias_error" });
+  }
 });
 
 app.listen(PORT, () => {
