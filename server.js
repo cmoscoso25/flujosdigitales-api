@@ -99,8 +99,8 @@ app.post("/flow/create", async (req, res) => {
     // ⚠️ Email es OPCIONAL (no validar si no viene)
 
     // 3) URLs separadas
-    const urlConfirmation = `${API_BASE}/webhook/flow`;                 // Webhook server-to-server (vive aquí)
-    const urlReturn       = `${SITE_BASE}/gracias.html?token={token}`;  // Retorno visible al usuario
+    const urlConfirmation = `${API_BASE}/webhook/flow`; // Webhook server-to-server (vive aquí)
+    const urlReturn       = `${SITE_BASE}/gracias.html`; // SIN {token}, Flow lo maneja
     const urlCancel       = `${SITE_BASE}/gracias.html?error=payment_failed`;
 
     // 4) Parámetros para Flow
