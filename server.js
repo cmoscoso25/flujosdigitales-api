@@ -62,6 +62,12 @@ function signFlowParams(params, secret) {
     .join("&");
   return crypto.createHmac("sha256", secret).update(sorted).digest("hex");
 }
+// 🔧 Firma/Envía solo los campos realmente presentes
+function clean(obj) {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([_, v]) => v !== undefined && v !== null && v !== "")
+  );
+}
 
 // === Health ===
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
@@ -117,11 +123,12 @@ app.post("/flow/create", async (req, res) => {
       // paymentMethod: 9, // descomenta si quieres forzar Webpay
     };
 
-    // 5) Firma
-    const s = signFlowParams(params, FLOW_SECRET_KEY);
+    // 🔧 5) Limpiar y firmar EXACTAMENTE lo que se enviará
+    const cleaned = clean(params);
+    const s = signFlowParams(cleaned, FLOW_SECRET_KEY);
 
     // 6) Llamada a Flow
-    const bodyEncoded = toFormUrlEncoded({ ...params, s });
+    const bodyEncoded = toFormUrlEncoded({ ...cleaned, s });
     const r = await fetch("https://www.flow.cl/api/payment/create", {
       method: "POST",
       headers: {
