@@ -1,219 +1,303 @@
-// server.js — FlujosDigitales API
-// Node 20+
-// ---------------------------------------------
-// ENV esperadas en Render:
-// FLOW_ENV=PROD | SANDBOX
-// FLOW_API_KEY=xxxxx
-// FLOW_SECRET_KEY=xxxxx
-// BASE_URL=https://flujosdigitales-api.onrender.com
-// SITE_BASE=https://flujosdigitales.com
-// ---------------------------------------------
-
+/* eslint-disable no-console */
 import express from "express";
+import fetch from "node-fetch";
 import crypto from "crypto";
 import cors from "cors";
+import path from "path";
+import fs from "fs";
 
-const app = express();
-const PORT = process.env.PORT || 10000;
+// ====== ENV ======
+const {
+  PORT = 10000,
+  NODE_ENV = "production",
 
-// === ENV ===
-const FLOW_ENV       = String(process.env.FLOW_ENV || "PROD").toUpperCase().trim();
-const FLOW_API_KEY   = (process.env.FLOW_API_KEY || "").trim();
-const FLOW_SECRET    = (process.env.FLOW_SECRET_KEY || "").trim();
-const API_BASE       = (process.env.API_BASE || process.env.BASE_URL || "").replace(/\/+$/, "");
-const SITE_BASE      = (process.env.SITE_BASE || "").replace(/\/+$/, "");
+  // Sitio y API bases
+  SITE_BASE = "https://flujosdigitales.com",
+  API_BASE = "https://flujosdigitales-api.onrender.com",
 
-// Host de Flow según ambiente (evita mezclar sandbox/prod)
-const FLOW_HOST = FLOW_ENV === "SANDBOX"
-  ? "https://sandbox.flow.cl"
-  : "https://www.flow.cl";
+  // Flow
+  FLOW_API_KEY,
+  FLOW_SECRET_KEY,
+  FLOW_ENV = "PROD", // "DEV" o "PROD"
+  // URL endpoints (Flow)
+  // PROD: https://www.flow.cl/api/
+  // DEV : https://sandbox.flow.cl/api/
+  // Si no entregas explícito, se deriva desde FLOW_ENV:
+  FLOW_API_BASE,
 
-const FLOW_CREATE_URL = `${FLOW_HOST}/api/payment/create`;
+  // Webhook
+  WEBHOOK_SECRET = "", // opcional si deseas firmar/validar adicional con tu propio secreto
 
-// === CORS ===
-const ALLOWED_ORIGINS = [
-  "https://flujosdigitales.com",
-  "https://www.flujosdigitales.com",
-  // "http://localhost:5500", // habilítalo si pruebas local
-];
+  // Correo
+  RESEND_API_KEY,         // si usas Resend
+  MAIL_FROM = "Flujos Digitales <soporte@flujosdigitales.com>",
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Accept"],
-}));
-app.options("*", cors());
+  // eBook
+  EBOOK_PATH = "./ebook/FlujosDigitales.pdf", // Ruta en el server
+  EBOOK_FILENAME = "FlujosDigitales.pdf",
 
-// === Parsers ===
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+  // Otros
+  TOKEN_TTL_HOURS = "48",
+} = process.env;
 
-// === Utils ===
-const isValidEmail = (s="") => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s).trim());
-
-const toFormUrlEncoded = (obj) =>
-  Object.entries(obj)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-
-// firma HMAC-SHA256 en HEX sobre los campos ORDENADOS
-function signFlowParams(params, secret) {
-  const sorted = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join("&");
-  return crypto.createHmac("sha256", secret).update(sorted).digest("hex");
+if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
+  console.error("[FATAL] Falta FLOW_API_KEY o FLOW_SECRET_KEY en variables de entorno.");
+  process.exit(1);
 }
 
-// eliminar null/undefined/""
-const clean = (obj) =>
-  Object.fromEntries(Object.entries(obj).filter(([_, v]) => v !== undefined && v !== null && v !== ""));
+const FLOW_BASE =
+  (FLOW_API_BASE && FLOW_API_BASE.trim()) ||
+  (FLOW_ENV === "DEV" ? "https://sandbox.flow.cl/api" : "https://www.flow.cl/api");
 
-// === Health ===
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  env: FLOW_ENV,
-  flowHost: FLOW_HOST,
-  ts: Date.now()
-}));
+const app = express();
 
-/**
- * POST /flow/create
- * Body: amount (obligatorio), email (opcional)
- */
-app.post("/flow/create", async (req, res) => {
-  try {
-    // Validaciones base
-    if (!FLOW_API_KEY || !FLOW_SECRET) {
-      return res.status(200).json({ ok: false, error: "missing_flow_keys" });
-    }
-    if (!API_BASE || !SITE_BASE) {
-      return res.status(200).json({ ok: false, error: "missing_base_urls", detail: { API_BASE, SITE_BASE } });
-    }
+// ====== Middlewares ======
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-    // Entrada
-    const amountRaw = req.body?.amount ?? req.query?.amount;
-    const emailRaw  = String(req.body?.email ?? req.query?.email ?? "").trim();
-    const hasEmail  = isValidEmail(emailRaw);
+// CORS: permitir tu dominio y pruebas locales
+app.use(
+  cors({
+    origin: [
+      "https://flujosdigitales.com",
+      "https://www.flujosdigitales.com",
+      "http://localhost:5173",
+      "http://localhost:3000",
+    ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-Signature", "X-Requested-With"],
+    credentials: false,
+    maxAge: 86400,
+  })
+);
 
-    const amount = Number(amountRaw || 0);
-    if (!amount || amount <= 0) {
-      return res.status(200).json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
-    }
+// ====== Utils ======
+const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-    // URLs
-    const urlConfirmation = `${API_BASE}/webhook/flow`;         // debe responder 200 OK
-    const urlReturn       = `${SITE_BASE}/gracias.html`;        // sin {token}
-    const urlCancel       = `${SITE_BASE}/gracias.html?error=payment_failed`;
+function flowHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "ApiKey": FLOW_API_KEY,
+    "X-Flow-API-Key": FLOW_API_KEY, // por compatibilidad si Flow lo pide
+  };
+}
 
-    // commerceOrder: único, numérico, sin guiones (evita 400 en algunos comercios)
-    const commerceOrder = `${Date.now()}${Math.floor(Math.random() * 100000)}`;
+// Firma simple para tus endpoints (opcional)
+function hmacSha256(data, secret) {
+  return crypto.createHmac("sha256", secret).update(data).digest("hex");
+}
 
-    // Params para Flow
-    const rawParams = {
-      apiKey: FLOW_API_KEY,
-      commerceOrder,
-      subject: "Ebook Flujos Digitales",
-      currency: "CLP",
-      amount: String(amount),
-      ...(hasEmail ? { email: emailRaw } : {}),
-      urlConfirmation,
-      urlReturn,
-      urlCancel,
-      // paymentMethod: 9, // si quieres forzar Webpay, descomenta
-    };
+// Memoria anti-duplicado (idempotencia básica por commerceOrder)
+const sentSet = new Set();
+const SENT_TTL_MS = 1000 * 60 * 60 * 12; // 12 h
+function markSentOnce(key) {
+  if (sentSet.has(key)) return false;
+  sentSet.add(key);
+  setTimeout(() => sentSet.delete(key), SENT_TTL_MS);
+  return true;
+}
 
-    // Limpiar + firmar exactamente lo que se envía
-    const params = clean(rawParams);
-    const s = signFlowParams(params, FLOW_SECRET);
+// ====== Email ======
+async function sendEmailWithResend(to, subject, htmlBody, attachmentPath, filename) {
+  if (!RESEND_API_KEY) throw new Error("RESEND_API_KEY no configurado");
+  // Resend API simple
+  const body = {
+    from: MAIL_FROM,
+    to: [to],
+    subject,
+    html: htmlBody,
+    attachments: [],
+  };
 
-    // Llamada a Flow
-    const bodyEncoded = toFormUrlEncoded({ ...params, s });
-
-    const r = await fetch(FLOW_CREATE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-      },
-      body: bodyEncoded,
+  if (attachmentPath && fs.existsSync(attachmentPath)) {
+    const base64 = fs.readFileSync(attachmentPath).toString("base64");
+    body.attachments.push({
+      content: base64,
+      filename: filename || path.basename(attachmentPath),
     });
-
-    const text = await r.text().catch(() => "");
-    let data = null;
-    try { data = JSON.parse(text); } catch { /* Flow puede devolver texto plano */ }
-
-    if (!r.ok) {
-      // Log visible en Render -> Logs
-      console.error("Flow create failed:", {
-        status: r.status,
-        endpoint: FLOW_CREATE_URL,
-        env: FLOW_ENV,
-        responseText: text?.slice(0, 800)
-      });
-      // ⬇⬇⬇ cambio clave: devolvemos 200 para que el cliente vea el JSON de error
-      return res.status(200).json({
-        ok: false,
-        error: `flow_create_failed_${r.status}`,
-        detail: data || text || null,
-        flow_status: r.status
-      });
-    }
-
-    // Normalización salida
-    const token = data?.token ?? data?.data?.token ?? null;
-    const url   = data?.url ?? (token ? `https://www.flow.cl/btn.php?token=${token}` : null);
-
-    if (!token || !url) {
-      console.error("Flow unexpected response:", { data, text: text?.slice(0, 800) });
-      return res.status(200).json({ ok: false, error: "flow_create_unexpected_response", detail: data || text || null });
-    }
-
-    return res.json({ ok: true, flow: { token, url }, meta: { commerceOrder, env: FLOW_ENV } });
-  } catch (err) {
-    console.error("flow/create error:", err);
-    return res.status(200).json({ ok: false, error: "server_error" });
   }
-});
 
-// Webhook: debe responder 200 OK siempre
-app.all("/webhook/flow", (req, res) => {
-  console.log("FLOW WEBHOOK =>", {
-    method: req.method,
-    query: req.query,
-    body: req.body,
-    ts: new Date().toISOString(),
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
-  res.status(200).send("OK");
-});
 
-// === Alias GET para depurar desde el navegador ===
-// Permite: https://flujosdigitales-api.onrender.com/flow/create?amount=9990&email=tu@correo.cl
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Resend error: ${resp.status} ${txt}`);
+  }
+  return resp.json();
+}
+
+// ====== Flow helpers ======
+async function flowCreatePayment({ amount, email }) {
+  const url = `${FLOW_BASE}/payment/create`;
+  const payload = {
+    amount: Number(amount),
+    email,                        // <— MUY IMPORTANTE (no dependemos de memoria)
+    currency: "CLP",
+    subject: "Ebook Flujos Digitales",
+    commerceOrder: `${Date.now()}`, // identificador propio
+    urlReturn: `${SITE_BASE}/gracias.html`,
+    urlConfirmation: `${API_BASE}/webhook/flow`,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: flowHeaders(),
+    body: JSON.stringify(payload),
+  });
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (_) {
+    throw new Error(`Flow create parse error: ${text}`);
+  }
+  if (!resp.ok || json.code) {
+    throw new Error(`Flow create failed: ${resp.status} ${text}`);
+  }
+  return json; // { token, url, commerceOrder, env }
+}
+
+async function flowGetStatusByToken(token) {
+  // Documentación Flow: payment/getStatus (recibe token)
+  const url = `${FLOW_BASE}/payment/getStatus?token=${encodeURIComponent(token)}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: flowHeaders(),
+  });
+  const text = await resp.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (_) {
+    throw new Error(`Flow status parse error: ${text}`);
+  }
+  if (!resp.ok || json.code) {
+    throw new Error(`Flow status failed: ${resp.status} ${text}`);
+  }
+  // json.status === 2 => pagado
+  return json;
+}
+
+// ====== Rutas públicas ======
+
+// Salud / wake-up
+app.get("/", (_req, res) => res.send("OK"));
+app.get("/webhook/flow", (_req, res) => res.send("OK")); // GET de verificación simple
+
+// Crear pago desde el botón (Opción B: email se pide antes)
 app.get("/flow/create", async (req, res) => {
   try {
-    const body = new URLSearchParams(req.query).toString();
-    const r = await fetch(`${API_BASE}/flow/create`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
-      body
-    });
-    const text = await r.text();
-    res.status(200).type("application/json").send(text);
-  } catch (e) {
-    console.error("GET alias error:", e);
-    res.status(200).json({ ok: false, error: "alias_error" });
+    const amount = Number(req.query.amount || "0");
+    const email = String(req.query.email || "").trim().toLowerCase();
+
+    if (!amount || amount < 100) {
+      return res.status(400).json({ ok: false, error: "bad_amount" });
+    }
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ ok: false, error: "bad_email" });
+    }
+
+    const created = await flowCreatePayment({ amount, email });
+    // devolvemos la info mínima para redirigir
+    return res.json({ ok: true, flow: created });
+  } catch (err) {
+    log("Flow create error:", err.message);
+    return res.status(400).json({ ok: false, error: "flow_create_failed_400", detail: String(err.message) });
   }
 });
 
+// Endpoint de verificación para la página de gracias (consulta directa a Flow)
+app.get("/flow/status", async (req, res) => {
+  const token = String(req.query.token || "");
+  if (!token) return res.status(400).json({ ok: false, error: "missing_token" });
+
+  try {
+    const st = await flowGetStatusByToken(token);
+    // si viene el email en la respuesta (Flow suele devolverlo)
+    const email =
+      st.customerEmail ||
+      st.email ||
+      (st.customer && st.customer.email) ||
+      "";
+
+    return res.json({
+      ok: true,
+      status: st.status,        // 2 = pagado
+      email,
+      commerceOrder: st.commerceOrder,
+    });
+  } catch (err) {
+    log("flow/status error:", err.message);
+    return res.status(500).json({ ok: false, error: "status_failed", detail: String(err.message) });
+  }
+});
+
+// ====== Webhook de Flow ======
+app.post("/webhook/flow", async (req, res) => {
+  try {
+    log("FLOW WEBHOOK =>", JSON.stringify(req.body));
+
+    const token = req.body?.token || req.query?.token;
+    if (!token) {
+      return res.status(400).send("missing token");
+    }
+
+    // Validamos estado con Flow por token (no dependemos de memoria)
+    const st = await flowGetStatusByToken(token);
+
+    // Idempotencia por commerceOrder (evita duplicados)
+    const orderKey = `order:${st.commerceOrder || token}`;
+    if (!markSentOnce(orderKey)) {
+      log("Webhook idempotente: ya procesado", orderKey);
+      return res.send("ok");
+    }
+
+    // status 2 = pagado
+    if (Number(st.status) === 2) {
+      const buyerEmail =
+        st.customerEmail ||
+        st.email ||
+        (st.customer && st.customer.email);
+
+      if (!buyerEmail) {
+        // si faltase por algún motivo, no rompas el flujo — solo registra
+        log("Pago OK pero sin email en status:", JSON.stringify(st));
+      } else {
+        // Enviar el eBook adjunto
+        const subject = "Tu eBook de Flujos Digitales";
+        const bodyHtml = `
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif">
+            <h2>¡Gracias por tu compra!</h2>
+            <p>Adjunto encontrarás tu eBook <b>${EBOOK_FILENAME}</b>.</p>
+            <p>Si tienes dudas, escríbenos a soporte@flujosdigitales.com</p>
+          </div>
+        `;
+        await sendEmailWithResend(buyerEmail, subject, bodyHtml, EBOOK_PATH, EBOOK_FILENAME);
+        log("Correo enviado a:", buyerEmail);
+      }
+    } else {
+      log("Webhook recibido, pero status no es pagado:", st.status);
+    }
+
+    return res.send("ok");
+  } catch (err) {
+    log("Webhook error:", err.message);
+    // Aunque falle el envío, responde 200 para que Flow no reintente infinito.
+    return res.send("ok");
+  }
+});
+
+// ====== Arranque ======
 app.listen(PORT, () => {
-  console.log("////////////////////////////////////////////////");
-  console.log(`🚀 API corriendo en http://0.0.0.0:${PORT}`);
-  console.log(`FLOW_ENV: ${FLOW_ENV}  (${FLOW_CREATE_URL})`);
-  console.log(`API_BASE:  ${API_BASE || "(definir)"}`);
-  console.log(`SITE_BASE: ${SITE_BASE || "(definir)"}`);
-  console.log("////////////////////////////////////////////////");
+  log("🚀 API corriendo en http://0.0.0.0:" + PORT);
+  log("FLOW_ENV:", FLOW_ENV, "(", FLOW_BASE, ")");
+  log("SITE_BASE:", SITE_BASE);
+  log("API_BASE:", API_BASE);
 });
