@@ -86,15 +86,18 @@ app.post("/flow/create", async (req, res) => {
     }
 
     // 2) Parámetros de entrada
-    const amountRaw = req.body?.amount ?? req.query?.amount;
-    const email = String(req.body?.email ?? req.query?.email ?? "").trim();
+    // ✅ Email opcional (Opción B)
+  const amountRaw = req.body?.amount ?? req.query?.amount;
+  const emailRaw  = String(req.body?.email ?? req.query?.email ?? "").trim();
+  const hasEmail  = isValidEmail(emailRaw);
 
-    const amount = Number(amountRaw || 0);
-    if (!amount || amount <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
-    }
+  const amount = Number(amountRaw || 0);
+  if (!amount || amount <= 0) {
+    return res
+    .status(400)
+    .json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
+  }
+
     if (!isValidEmail(email)) {
       return res
         .status(400)
@@ -113,11 +116,10 @@ app.post("/flow/create", async (req, res) => {
       subject: "Ebook Flujos Digitales",
       currency: "CLP",
       amount: String(amount),
-      email,
+      ...(hasEmail ? { email: emailRaw } : {}),  // ✅ solo si lo envías
       urlConfirmation,
       urlReturn,
       urlCancel,
-      // paymentMethod: 9, // descomenta si quieres forzar Webpay
     };
 
     // 5) Firma
