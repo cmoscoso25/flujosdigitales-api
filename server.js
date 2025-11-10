@@ -112,7 +112,7 @@ app.post("/flow/create", async (req, res) => {
     // 4) Parámetros para Flow
     const params = {
       apiKey: FLOW_API_KEY,
-      commerceOrder: `web-${Date.now()}`,
+      commerceOrder: `${Date.now()}${Math.floor(Math.random() * 1000)}`,
       subject: "Ebook Flujos Digitales",
       currency: "CLP",
       amount: String(amount),
