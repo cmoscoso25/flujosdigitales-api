@@ -1,9 +1,9 @@
 // server.js — FlujosDigitales API (Render / Node 20+)
 //
-// Requisitos de ENV (Render -> Environment):
+// ENV (Render -> Environment):
 // FLOW_API_KEY=xxxxxxxxxxxxxxxx
 // FLOW_SECRET_KEY=yyyyyyyyyyyyyy
-// BASE_URL=https://flujosdigitales-api.onrender.com     (o API_BASE)
+// BASE_URL=https://flujosdigitales-api.onrender.com   (o API_BASE)
 // SITE_BASE=https://flujosdigitales.com
 //
 // Nota: API_BASE usa fallback a BASE_URL.
@@ -69,7 +69,7 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 /**
  * POST /flow/create
  * Crea la orden de pago en Flow
- * Body: amount, email (x-www-form-urlencoded o JSON)
+ * Body: amount (obligatorio), email (OPCIONAL)
  */
 app.post("/flow/create", async (req, res) => {
   try {
@@ -86,23 +86,17 @@ app.post("/flow/create", async (req, res) => {
     }
 
     // 2) Parámetros de entrada
-    // ✅ Email opcional (Opción B)
-  const amountRaw = req.body?.amount ?? req.query?.amount;
-  const emailRaw  = String(req.body?.email ?? req.query?.email ?? "").trim();
-  const hasEmail  = isValidEmail(emailRaw);
+    const amountRaw = req.body?.amount ?? req.query?.amount;
+    const emailRaw  = String(req.body?.email ?? req.query?.email ?? "").trim();
+    const hasEmail  = isValidEmail(emailRaw);
 
-  const amount = Number(amountRaw || 0);
-  if (!amount || amount <= 0) {
-    return res
-    .status(400)
-    .json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
-  }
-
-    if (!isValidEmail(email)) {
+    const amount = Number(amountRaw || 0);
+    if (!amount || amount <= 0) {
       return res
         .status(400)
-        .json({ ok: false, error: "invalid_email", detail: { email } });
+        .json({ ok: false, error: "missing_required_fields", detail: { amount: amountRaw } });
     }
+    // ⚠️ Email es OPCIONAL (no validar si no viene)
 
     // 3) URLs separadas
     const urlConfirmation = `${API_BASE}/webhook/flow`;                 // Webhook server-to-server (vive aquí)
@@ -120,6 +114,7 @@ app.post("/flow/create", async (req, res) => {
       urlConfirmation,
       urlReturn,
       urlCancel,
+      // paymentMethod: 9, // descomenta si quieres forzar Webpay
     };
 
     // 5) Firma
