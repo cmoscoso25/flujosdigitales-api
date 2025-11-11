@@ -1,15 +1,17 @@
 /****************************************************
- * FlujosDigitales API — “Modo Seguro”
+ * FlujosDigitales API — FINAL
  * - Axios (sin node-fetch)
- * - CORS + preflight + x-client-secret (desactivable)
- * - Acepta JSON y URL-Encoded
- * - Flow create + confirm
- * - Email adjunto o link
+ * - CORS + preflight + x-client-secret (opcional)
+ * - Flow payment/create con firma HMAC (param "s")
+ * - Flow payment/getStatus
+ * - Envío de eBook por correo (SMTP real SSL 465)
+ * - /health, /flow/create (POST+GET), /flow/confirm
  ****************************************************/
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
+import crypto from "crypto";
 import nodemailer from "nodemailer";
 import fs from "fs";
 import path from "path";
@@ -17,7 +19,7 @@ import { fileURLToPath } from "url";
 
 dotenv.config();
 
-/* --------- App base --------- */
+/* ========= App ========= */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 const app = express();
@@ -25,27 +27,28 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/* --------- Config --------- */
-const PORT = process.env.PORT || 10000;
+/* ========= Config ========= */
+const PORT          = process.env.PORT || 10000;
 
 const SITE_BASE     = process.env.SITE_BASE     || "https://flujosdigitales.com";
 const FLOW_API_BASE = process.env.FLOW_API_BASE || "https://www.flow.cl/api";
 const FLOW_API_KEY  = process.env.FLOW_API_KEY  || "";
+const FLOW_SECRET   = process.env.FLOW_SECRET   || ""; // firma HMAC requerida por Flow
+
 const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-// Si pones AUTH_REQUIRED=false en Render, la API NO exigirá x-client-secret
 const AUTH_REQUIRED = (process.env.AUTH_REQUIRED ?? "true").toLowerCase() !== "false";
 
-const MAIL_HOST   = process.env.MAIL_HOST || "sandbox.smtp.mailtrap.io";
-const MAIL_PORT   = Number(process.env.MAIL_PORT || 2525);
-const MAIL_USER   = process.env.MAIL_USER || "";
-const MAIL_PASS   = process.env.MAIL_PASS || "";
-const FROM_EMAIL  = process.env.FROM_EMAIL || "no-reply@flujosdigitales.com";
+const SMTP_HOST   = process.env.SMTP_HOST || "mail.flujosdigitales.com";
+const SMTP_PORT   = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER   = process.env.SMTP_USER || "ventas@flujosdigitales.com";
+const SMTP_PASS   = process.env.SMTP_PASS || "";
+const FROM_EMAIL  = process.env.FROM_EMAIL || 'Flujos Digitales <ventas@flujosdigitales.com>';
 
 const EBOOK_FILENAME     = "FlujosDigitales-100-Prompts.pdf";
-const EBOOK_PATH         = path.join(__dirname, "assets", EBOOK_FILENAME);
+const EBOOK_PATH         = path.join(__dirname, "assets", EBOOK_FILENAME); // opcional adjunto local
 const EBOOK_FALLBACK_URL = `${SITE_BASE}/descargas/${EBOOK_FILENAME}`;
 
-/* --------- CORS (incluye x-client-secret) --------- */
+/* ========= CORS ========= */
 app.use(cors({
   origin: [
     "https://flujosdigitales.com",
@@ -57,20 +60,24 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-/* --------- Logs de arranque --------- */
-console.log("🚀 API Boot @", new Date().toISOString());
+/* ========= Logs ========= */
+console.log("🚀 API Boot", new Date().toISOString());
 console.log("SITE_BASE     :", SITE_BASE);
 console.log("FLOW_API_BASE :", FLOW_API_BASE);
 console.log("FLOW_API_KEY  :", FLOW_API_KEY ? "OK" : "MISSING ❌");
-console.log("CLIENT_SECRET :", CLIENT_SECRET ? "OK" : "MISSING (AUTH_REQUIRED="+AUTH_REQUIRED+")");
+console.log("FLOW_SECRET   :", FLOW_SECRET ? "OK" : "MISSING ❌ (firma requerida por tu cuenta Flow)");
+console.log("SMTP_HOST     :", SMTP_HOST);
+console.log("SMTP_USER     :", SMTP_USER);
+console.log("SMTP_PORT     :", SMTP_PORT, "(secure=SSL)");
+console.log("CLIENT_SECRET :", CLIENT_SECRET ? "OK" : `MISSING (AUTH_REQUIRED=${AUTH_REQUIRED})`);
 
-/* --------- Health --------- */
+/* ========= Health ========= */
 app.get("/health", (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
 
-/* --------- Guard de auth front→API --------- */
+/* ========= Guard auth front→API ========= */
 function requireClientSecret(req, res) {
-  if (!AUTH_REQUIRED) return true;   // modo diagnóstico
-  if (!CLIENT_SECRET) return true;   // si no está definida, no bloqueamos
+  if (!AUTH_REQUIRED) return true;
+  if (!CLIENT_SECRET) return true;
   const incoming = req.headers["x-client-secret"];
   if (!incoming || String(incoming) !== String(CLIENT_SECRET)) {
     res.status(401).json({ ok: false, error: "Unauthorized (x-client-secret)" });
@@ -79,31 +86,41 @@ function requireClientSecret(req, res) {
   return true;
 }
 
-/* --------- Axios Flow --------- */
+/* ========= Axios Flow ========= */
 const flow = axios.create({
   baseURL: FLOW_API_BASE,
   timeout: 30000,
   headers: { "Content-Type": "application/x-www-form-urlencoded" }
 });
 
-const form = (obj) => new URLSearchParams(obj).toString();
+const toForm = (obj) => new URLSearchParams(obj).toString();
 
-/* --------- Email --------- */
+/* ========= Firma HMAC (param "s") =========
+   Ordena por clave, concatena "k=v&k2=v2..." y firma HMAC-SHA256
+*/
+function signParams(paramsObj, secret) {
+  const keys = Object.keys(paramsObj)
+    .filter(k => paramsObj[k] !== undefined && paramsObj[k] !== null && k !== "s")
+    .sort();
+  const base = keys.map(k => `${k}=${paramsObj[k]}`).join("&");
+  return crypto.createHmac("sha256", secret).update(base).digest("hex");
+}
+
+/* ========= Email ========= */
 function buildTransport() {
   return nodemailer.createTransport({
-    host: MAIL_HOST,
-    port: MAIL_PORT,
-    secure: false,
-    auth: (MAIL_USER && MAIL_PASS) ? { user: MAIL_USER, pass: MAIL_PASS } : undefined
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: true, // SSL 465
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
 }
 
 async function sendEbookEmail({ to, orderNumber }) {
-  if (!to) throw new Error("Destinatario vacío");
   const transporter = buildTransport();
-
   const attachments = [];
   let extra = "";
+
   if (fs.existsSync(EBOOK_PATH)) {
     attachments.push({ filename: EBOOK_FILENAME, path: EBOOK_PATH, contentType: "application/pdf" });
   } else {
@@ -117,7 +134,7 @@ async function sendEbookEmail({ to, orderNumber }) {
       <p><b>Orden:</b> ${orderNumber || "(no disponible)"}.</p>
       ${extra}
       <hr style="border:none;border-top:1px solid #eee;margin:12px 0">
-      <p style="font-size:12px;color:#666">Soporte: <a href="mailto:soporte@flujosdigitales.com">soporte@flujosdigitales.com</a></p>
+      <p style="font-size:12px;color:#666">Soporte: <a href="mailto:ventas@flujosdigitales.com">ventas@flujosdigitales.com</a></p>
     </div>
   `;
 
@@ -132,8 +149,8 @@ async function sendEbookEmail({ to, orderNumber }) {
   return info?.messageId || true;
 }
 
-/* --------- Helpers Flow --------- */
-async function flowCreate({ email, amount, subject = "eBook Flujos Digitales" }) {
+/* ========= Flow helpers ========= */
+async function flowCreatePayment({ email, amount, subject = "eBook Flujos Digitales" }) {
   const payload = {
     apiKey: FLOW_API_KEY,
     commerceOrder: `FD-${Date.now()}`,
@@ -142,30 +159,32 @@ async function flowCreate({ email, amount, subject = "eBook Flujos Digitales" })
     amount: Number(amount),
     email,
     urlReturn: `${SITE_BASE}/gracias.html`,
-    urlConfirmation: `${SITE_BASE}/gracias.html` // simple; confirmamos con token en gracias
+    urlConfirmation: `${SITE_BASE}/gracias.html` // confirmación simple desde el front
   };
-  const { data } = await flow.post("/payment/create", form(payload));
-  return data; // { url, token, ... } o error
+  // firma HMAC
+  payload.s = signParams(payload, FLOW_SECRET);
+
+  const { data } = await flow.post("/payment/create", toForm(payload));
+  return data; // { url, token, ... } o { code, message }
 }
 
-async function flowStatusByToken(token) {
-  const { data } = await flow.post("/payment/getStatus", form({ apiKey: FLOW_API_KEY, token }));
+async function flowGetStatusByToken(token) {
+  const payload = { apiKey: FLOW_API_KEY, token };
+  payload.s = signParams(payload, FLOW_SECRET);
+  const { data } = await flow.post("/payment/getStatus", toForm(payload));
   return data;
 }
 
-/* =====================================================
- * RUTAS
- * ===================================================== */
+/* ========= Rutas ========= */
 
-/* Crear pago — POST (JSON) */
+// Crear pago — POST JSON
 app.post("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { email, amount, subject } = req.body || {};
-    if (!email || !amount) {
-      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
-    }
-    const result = await flowCreate({ email, amount, subject });
+    if (!email || !amount) return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+
+    const result = await flowCreatePayment({ email, amount, subject });
     if (!result?.url) {
       return res.status(500).json({ ok: false, error: "Flow no devolvió URL", detail: result });
     }
@@ -176,15 +195,14 @@ app.post("/flow/create", async (req, res) => {
   }
 });
 
-/* Crear pago — GET (fallback) */
+// Crear pago — GET fallback
 app.get("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { email, amount, subject } = req.query || {};
-    if (!email || !amount) {
-      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
-    }
-    const result = await flowCreate({ email, amount, subject });
+    if (!email || !amount) return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+
+    const result = await flowCreatePayment({ email, amount, subject });
     if (!result?.url) {
       return res.status(500).json({ ok: false, error: "Flow no devolvió URL", detail: result });
     }
@@ -195,16 +213,17 @@ app.get("/flow/create", async (req, res) => {
   }
 });
 
-/* Confirmación (desde gracias.html) */
+// Confirmación (desde gracias.html)
 app.post("/flow/confirm", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { token, email, order } = req.body || {};
     if (!token) return res.status(400).json({ ok: false, error: "Falta token" });
 
-    const st = await flowStatusByToken(token);
+    const st = await flowGetStatusByToken(token);
     const statusVal = String(st?.status ?? st?.paymentData?.status ?? "");
     const paid = statusVal === "2" || statusVal.toLowerCase() === "paid";
+
     if (!paid) return res.status(202).json({ ok: false, message: "Pago aún no confirmado", detail: st });
 
     const buyerEmail =
@@ -231,10 +250,7 @@ app.post("/flow/confirm", async (req, res) => {
   }
 });
 
-/* Assets opcionales (si sirves el PDF desde /assets) */
-app.use("/assets", express.static(path.join(__dirname, "assets"), { maxAge: "7d" }));
-
-/* Start */
+/* ====== Start ====== */
 app.listen(PORT, () => {
   console.log(`✅ Live on http://0.0.0.0:${PORT}`);
 });
