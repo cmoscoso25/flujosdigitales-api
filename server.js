@@ -31,15 +31,18 @@ const allowedOrigins = [
   "http://127.0.0.1",
 ];
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error("Origen no permitido por CORS: " + origin), false);
-    },
-  })
-);
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // permite navegador normal
+    const allowed = [
+      "https://flujosdigitales.com",
+      "https://www.flujosdigitales.com"
+    ];
+    if (allowed.includes(origin)) return callback(null, true);
+    return callback(new Error("CORS bloqueado: " + origin), false);
+  }
+}));
+
 
 /* ========= Config ========= */
 
@@ -182,7 +185,6 @@ async function flowCreatePayment({ commerceOrder, subject, amount, email, urlRet
 async function flowGetStatusByToken(token) {
   const payload = { apiKey: FLOW_API_KEY, token };
   payload.s = signParams(payload);
-  // IMPORTANTE: payment/getStatus es GET (docs oficiales)
   const { data } = await flow.get("/payment/getStatus", { params: payload });
   return data;
 }
