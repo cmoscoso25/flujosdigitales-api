@@ -3,7 +3,7 @@
  * - Firma HMAC-SHA256 (param "s") usando FLOW_SECRET_KEY
  * - Axios (x-www-form-urlencoded)
  * - CORS + x-client-secret (opcional)
- * - /health, /flow/create (POST/GET), /flow/confirm, /flow/confirm-no-token
+ * - /health, /flow/create (POST/GET), /flow/confirm
  * - Envío de eBook por SMTP real (SSL 465)
  ****************************************************/
 import express from "express";
@@ -12,78 +12,64 @@ import dotenv from "dotenv";
 import axios from "axios";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
-import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import fs from "fs";
 
 dotenv.config();
 
-/* ========= App base ========= */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
 const app = express();
-
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* ========= Config ========= */
-const PORT          = process.env.PORT || 10000;
-
-const SITE_BASE     = process.env.SITE_BASE     || "https://flujosdigitales.com";
-const FLOW_API_BASE = process.env.FLOW_API_BASE || "https://www.flow.cl/api";
-const FLOW_API_KEY  = process.env.FLOW_API_KEY  || "";
-// *** OJO: usamos FLOW_SECRET_KEY (tal cual en Flow) ***
-const FLOW_SECRET   = process.env.FLOW_SECRET_KEY || "";
-
-const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-const AUTH_REQUIRED = (process.env.AUTH_REQUIRED ?? "true").toLowerCase() !== "false";
-
-const SMTP_HOST   = process.env.SMTP_HOST || "mail.flujosdigitales.com";
-const SMTP_PORT   = Number(process.env.SMTP_PORT || 465);
-const SMTP_USER   = process.env.SMTP_USER || "ventas@flujosdigitales.com";
-const SMTP_PASS   = process.env.SMTP_PASS || "";
-const FROM_EMAIL  = process.env.FROM_EMAIL || "Flujos Digitales <ventas@flujosdigitales.com>";
-
-const EBOOK_FILENAME     = "FlujosDigitales-100-Prompts.pdf";
-const EBOOK_PATH         = path.join(__dirname, "assets", EBOOK_FILENAME); // si no existe, se envía link
-const EBOOK_FALLBACK_URL = `${SITE_BASE}/descargas/${EBOOK_FILENAME}`;
-
 /* ========= CORS ========= */
-app.use(cors({
-  origin: ["https://flujosdigitales.com", "https://www.flujosdigitales.com"],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Accept", "x-client-secret"],
-  maxAge: 86400
-}));
-app.options("*", cors());
+const allowedOrigins = [
+  "https://flujosdigitales.com",
+  "https://www.flujosdigitales.com",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost",
+  "http://127.0.0.1",
+];
 
-/* ========= Logs de arranque ========= */
-console.log("🚀 API Boot:", new Date().toISOString());
-console.log("SITE_BASE     :", SITE_BASE);
-console.log("FLOW_API_BASE :", FLOW_API_BASE);
-console.log("FLOW_API_KEY  :", FLOW_API_KEY ? "OK" : "MISSING ❌");
-console.log("FLOW_SECRET   :", FLOW_SECRET ? "OK" : "MISSING ❌ (usa FLOW_SECRET_KEY de Flow)");
-console.log("SMTP_HOST     :", SMTP_HOST);
-console.log("SMTP_USER     :", SMTP_USER);
-console.log("SMTP_PORT     :", SMTP_PORT, "(secure=SSL 465)");
-console.log("CLIENT_SECRET :", CLIENT_SECRET ? "OK" : `MISSING (AUTH_REQUIRED=${AUTH_REQUIRED})`);
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("Origen no permitido por CORS: " + origin), false);
+    },
+  })
+);
 
-/* ========= Salud ========= */
-app.get("/health", (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
+/* ========= Config ========= */
 
-/* ========= Guard x-client-secret ========= */
-function requireClientSecret(req, res) {
-  if (!AUTH_REQUIRED) return true;
-  if (!CLIENT_SECRET) return true;
-  const incoming = req.headers["x-client-secret"];
-  if (!incoming || String(incoming) !== String(CLIENT_SECRET)) {
-    res.status(401).json({ ok: false, error: "Unauthorized (x-client-secret)" });
-    return false;
-  }
-  return true;
-}
+const PORT = process.env.PORT || 10000;
 
-/* ========= Axios Flow ========= */
+// Flow
+const FLOW_API_BASE = process.env.FLOW_API_BASE || "https://www.flow.cl/api";
+const FLOW_API_KEY = process.env.FLOW_API_KEY;
+const FLOW_SECRET_KEY = process.env.FLOW_SECRET_KEY;
+
+// eBook
+const EBOOK_PATH = process.env.EBOOK_PATH || "/mnt/data/ebook.pdf";
+const EBOOK_FILENAME =
+  process.env.EBOOK_FILENAME || "Automatiza_tu_negocio_con_n8n.pdf";
+
+// SMTP
+const SMTP_HOST = process.env.SMTP_HOST || "mail.flujosdigitales.com";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+
+// Seguridad / client-secret (opcional)
+const AUTH_REQUIRED = (process.env.AUTH_REQUIRED || "false")
+  .toString()
+  .toLowerCase() === "true";
+const CLIENT_CALLBACK_SECRET = process.env.CLIENT_CALLBACK_SECRET || "";
+const SITE_BASE = process.env.SITE_BASE || "https://flujosdigitales.com";
+
+/* ========= Helpers ========= */
+
 const flow = axios.create({
   baseURL: FLOW_API_BASE,
   timeout: 30000,
@@ -93,86 +79,112 @@ const toForm = (obj) => new URLSearchParams(obj).toString();
 
 /* ========= Firma HMAC-SHA256 =========
    - Orden alfabético de claves
-   - Concat: "k=v&k2=v2..."
-   - HMAC-SHA256 con FLOW_SECRET_KEY
-*/
-function signParams(paramsObj) {
-  const keys = Object.keys(paramsObj)
-    .filter(k => paramsObj[k] !== undefined && paramsObj[k] !== null && k !== "s")
-    .sort();
-  const base = keys.map(k => `${k}=${paramsObj[k]}`).join("&");
-  return crypto.createHmac("sha256", FLOW_SECRET).update(base).digest("hex");
+   - Concat: "k=v&k2=v2" PERO SIN & según docs: "kvalork2valor2"
+****************************************************/
+function signParams(params) {
+  if (!FLOW_SECRET_KEY) {
+    throw new Error("FLOW_SECRET_KEY no está configurado en el entorno");
+  }
+  const keys = Object.keys(params).sort();
+  const toSign = keys.map((k) => `${k}${params[k]}`).join("");
+  // console.log("String a firmar:", toSign);
+  const hmac = crypto.createHmac("sha256", FLOW_SECRET_KEY);
+  hmac.update(toSign);
+  return hmac.digest("hex");
 }
 
-/* ========= Email ========= */
-function buildTransport() {
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: true, // SSL (465)
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-}
+/* ========= SMTP Transport ========= */
+
+const transporter = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_PORT === 465,
+  auth: {
+    user: SMTP_USER,
+    pass: SMTP_PASS,
+  },
+});
 
 async function sendEbookEmail({ to, orderNumber }) {
-  const transporter = buildTransport();
-
-  const attachments = [];
-  let extra = "";
-  if (fs.existsSync(EBOOK_PATH)) {
-    attachments.push({
-      filename: EBOOK_FILENAME,
-      path: EBOOK_PATH,
-      contentType: "application/pdf"
-    });
-  } else {
-    extra = `<p>Si no ves el adjunto, descarga desde: <a href="${EBOOK_FALLBACK_URL}" target="_blank">${EBOOK_FALLBACK_URL}</a></p>`;
+  if (!fs.existsSync(EBOOK_PATH)) {
+    throw new Error("No se encontró el archivo del eBook en el servidor");
   }
 
-  const html = `
-    <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;line-height:1.5">
-      <h2>¡Gracias por tu compra!</h2>
-      <p>Adjuntamos tu eBook <b>${EBOOK_FILENAME}</b>.</p>
-      <p><b>Orden:</b> ${orderNumber || "(no disponible)"}.</p>
-      ${extra}
-      <hr style="border:none;border-top:1px solid #eee;margin:12px 0">
-      <p style="font-size:12px;color:#666">
-        Soporte: <a href="mailto:ventas@flujosdigitales.com">ventas@flujosdigitales.com</a>
-      </p>
-    </div>
-  `;
+  const subject = "Tu eBook de Automatizaciones IA ya está listo";
+  const text = [
+    "Hola,",
+    "",
+    "Gracias por tu compra de nuestro eBook \"100 Automatizaciones para tu negocio\".",
+    orderNumber ? `Número de orden Flow: ${orderNumber}` : "",
+    "",
+    "Te adjuntamos el PDF en este correo.",
+    "",
+    "Si tienes cualquier duda, escríbenos a soporte@flujosdigitales.com.",
+    "",
+    "Un abrazo,",
+    "Equipo FlujosDigitales.com",
+  ]
+    .filter(Boolean)
+    .join("\n");
 
-  const info = await transporter.sendMail({
-    from: FROM_EMAIL,
+  const html = text.replace(/\n/g, "<br>");
+
+  const mailOptions = {
+    from: `"Flujos Digitales" <${SMTP_USER}>`,
     to,
-    subject: "Tu eBook - Flujos Digitales",
+    subject,
+    text,
     html,
-    attachments
-  });
+    attachments: [
+      {
+        filename: EBOOK_FILENAME,
+        path: EBOOK_PATH,
+        contentType: "application/pdf",
+      },
+    ],
+  };
 
-  return info?.messageId || true;
+  return transporter.sendMail(mailOptions);
 }
 
-/* ========= Flow helpers ========= */
+/* ========= Middleware client-secret ========= */
 
-// Helper genérico para consultar getStatus con distintos criterios (token, flowOrder, commerceOrder)
-async function flowGetStatus(criteria = {}) {
-  const payload = { apiKey: FLOW_API_KEY, ...criteria };
+function requireClientSecret(req, res) {
+  if (!AUTH_REQUIRED) return true;
+  const headerSecret = req.headers["x-client-secret"];
+  if (!headerSecret || headerSecret !== CLIENT_CALLBACK_SECRET) {
+    res.status(401).json({ ok: false, error: "No autorizado" });
+    return false;
+  }
+  return true;
+}
+
+/* ========= Helper Flow: Crear pago ========= */
+
+async function flowCreatePayment({ commerceOrder, subject, amount, email, urlReturn, urlConfirmation }) {
+  const payload = {
+    apiKey: FLOW_API_KEY,
+    commerceOrder,
+    subject,
+    currency: "CLP",
+    amount,
+    email,
+    urlReturn,
+    urlConfirmation,
+  };
   payload.s = signParams(payload);
-  const { data } = await flow.post("/payment/getStatus", toForm(payload));
-  return data;
+  const { data } = await flow.post("/payment/create", toForm(payload));
+  return data; // { url, token, ... }
 }
 
-// Mantener compatibilidad con código existente
+/* ========= Helper Flow: Obtener estado por token (GET correcto) ========= */
+
 async function flowGetStatusByToken(token) {
-  return flowGetStatus({ token });
-}
-
-// Nuevo helper por número de orden (flowOrder numérico o commerceOrder string)
-async function flowGetStatusByOrder(order) {
-  if (!order) throw new Error("Se requiere order para obtener el estado del pago");
-  const key = /^\d+$/.test(String(order)) ? "flowOrder" : "commerceOrder";
-  return flowGetStatus({ [key]: order });
+  const payload = { apiKey: FLOW_API_KEY, token };
+  payload.s = signParams(payload);
+  // IMPORTANTE: payment/getStatus es GET (docs oficiales)
+  const { data } = await flow.get("/payment/getStatus", { params: payload });
+  return data;
 }
 
 /* ========= Rutas ========= */
@@ -181,102 +193,97 @@ async function flowGetStatusByOrder(order) {
 app.post("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
+
     const { email, amount, subject } = req.body || {};
     if (!email || !amount) {
-      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+      return res.status(400).json({ ok: false, error: "Faltan parámetros" });
     }
 
-    if (!FLOW_API_KEY || !FLOW_SECRET) {
-      return res.status(500).json({ ok: false, error: "Faltan credenciales de Flow (API_KEY o SECRET_KEY)" });
-    }
+    const order = `FD-${Date.now()}`;
 
-    const payload = {
-      apiKey: FLOW_API_KEY,
-      commerceOrder: `FD-${Date.now()}`,
-      subject: subject || "eBook Flujos Digitales",
-      currency: "CLP",
-      amount: Number(amount),
+    const urlReturn = `${SITE_BASE}/gracias.html?order=${encodeURIComponent(
+      order
+    )}`;
+    const urlConfirmation = `${process.env.DOMAIN || SITE_BASE}/flow/confirm`;
+
+    const pay = await flowCreatePayment({
+      commerceOrder: order,
+      subject: subject || "Compra eBook Flujos Digitales",
+      amount,
       email,
-      urlReturn: `${SITE_BASE}/gracias.html`,
-      urlConfirmation: `${SITE_BASE}/gracias.html`
-    };
-    payload.s = signParams(payload);
+      urlReturn,
+      urlConfirmation,
+    });
 
-    const { data: result } = await flow.post("/payment/create", toForm(payload));
-
-    if (!result?.url) {
-      return res.status(502).json({ ok: false, error: "Flow no devolvió URL", detail: result });
-    }
-
-    res.json({ ok: true, data: { url: result.url, token: result.token } });
+    return res.json({
+      ok: true,
+      order,
+      flowUrl: pay.url,
+      token: pay.token,
+    });
   } catch (err) {
     console.error("POST /flow/create:", err?.response?.data || err.message);
     res.status(500).json({
       ok: false,
-      error: "No se pudo crear el pago",
-      detail: err?.response?.data || err.message
+      error: "Error creando el pago en Flow",
+      detail: err?.response?.data || err.message,
     });
   }
 });
 
-// Crear pago — GET (fallback)
+// Crear pago — GET (compatibilidad con la landing actual si la usas)
 app.get("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
+
     const { email, amount, subject } = req.query || {};
     if (!email || !amount) {
-      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+      return res.status(400).json({ ok: false, error: "Faltan parámetros" });
     }
 
-    if (!FLOW_API_KEY || !FLOW_SECRET) {
-      return res.status(500).json({ ok: false, error: "Faltan credenciales de Flow (API_KEY o SECRET_KEY)" });
-    }
+    const order = `FD-${Date.now()}`;
+    const urlReturn = `${SITE_BASE}/gracias.html?order=${encodeURIComponent(
+      order
+    )}`;
+    const urlConfirmation = `${process.env.DOMAIN || SITE_BASE}/flow/confirm`;
 
-    const payload = {
-      apiKey: FLOW_API_KEY,
-      commerceOrder: `FD-${Date.now()}`,
-      subject: subject || "eBook Flujos Digitales",
-      currency: "CLP",
-      amount: Number(amount),
+    const pay = await flowCreatePayment({
+      commerceOrder: order,
+      subject: subject || "Compra eBook Flujos Digitales",
+      amount,
       email,
-      urlReturn: `${SITE_BASE}/gracias.html`,
-      urlConfirmation: `${SITE_BASE}/gracias.html`
-    };
-    payload.s = signParams(payload);
+      urlReturn,
+      urlConfirmation,
+    });
 
-    const { data: result } = await flow.post("/payment/create", toForm(payload));
-
-    if (!result?.url) {
-      return res.status(502).json({ ok: false, error: "Flow no devolvió URL", detail: result });
-    }
-
-    res.json({ ok: true, data: { url: result.url, token: result.token } });
+    return res.json({
+      ok: true,
+      order,
+      flowUrl: pay.url,
+      token: pay.token,
+    });
   } catch (err) {
     console.error("GET /flow/create:", err?.response?.data || err.message);
     res.status(500).json({
       ok: false,
-      error: "No se pudo crear el pago (GET)",
-      detail: err?.response?.data || err.message
+      error: "Error creando el pago en Flow",
+      detail: err?.response?.data || err.message,
     });
   }
 });
 
-// Confirmación desde gracias.html (token + email/opcional)
+// Confirmación desde la landing (gracias.html)
 app.post("/flow/confirm", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { token, email, order } = req.body || {};
-    if (!token) {
-      return res.status(400).json({ ok: false, error: "Falta token" });
-    }
+    if (!token) return res.status(400).json({ ok: false, error: "Falta token" });
 
     const st = await flowGetStatusByToken(token);
     const statusVal = String(st?.status ?? st?.paymentData?.status ?? "");
     const paid = statusVal === "2" || statusVal.toLowerCase() === "paid";
 
-    if (!paid) {
-      return res.status(202).json({ ok: false, message: "Pago aún no confirmado", detail: st });
-    }
+    if (!paid) return res.status(202).json({ ok: false, message: "Pago aún no confirmado", detail: st });
 
     const buyerEmail =
       email ||
@@ -294,78 +301,11 @@ app.post("/flow/confirm", async (req, res) => {
       await sendEbookEmail({ to: buyerEmail, orderNumber });
       return res.json({ ok: true, delivered: true, orderNumber });
     } else {
-      return res.json({
-        ok: true,
-        delivered: false,
-        reason: "Pago confirmado sin email",
-        orderNumber
-      });
+      return res.json({ ok: true, delivered: false, reason: "Pago confirmado sin email", orderNumber });
     }
   } catch (err) {
     console.error("POST /flow/confirm:", err?.response?.data || err.message);
-    res.status(500).json({
-      ok: false,
-      error: "Fallo confirmación/envío",
-      detail: err?.response?.data || err.message
-    });
-  }
-});
-
-// Confirmación sin token (fallback desde gracias.html)
-app.post("/flow/confirm-no-token", async (req, res) => {
-  try {
-    if (!requireClientSecret(req, res)) return;
-    const { email, order } = req.body || {};
-
-    if (!order) {
-      return res.status(400).json({
-        ok: false,
-        error: "Falta order para buscar el pago (confirm-no-token)"
-      });
-    }
-
-    const st = await flowGetStatusByOrder(order);
-    const statusVal = String(st?.status ?? st?.paymentData?.status ?? "");
-    const paid = statusVal === "2" || statusVal.toLowerCase() === "paid";
-
-    if (!paid) {
-      return res.status(202).json({
-        ok: false,
-        message: "Pago aún no confirmado (sin token)",
-        detail: st
-      });
-    }
-
-    const buyerEmail =
-      email ||
-      st?.paymentData?.payer?.email ||
-      st?.payer?.email ||
-      st?.customer?.email;
-
-    const orderNumber =
-      order ||
-      st?.paymentData?.commerceOrder ||
-      st?.commerceOrder ||
-      st?.orderNumber;
-
-    if (buyerEmail) {
-      await sendEbookEmail({ to: buyerEmail, orderNumber });
-      return res.json({ ok: true, delivered: true, orderNumber });
-    } else {
-      return res.json({
-        ok: true,
-        delivered: false,
-        reason: "Pago confirmado sin email (fallback)",
-        orderNumber
-      });
-    }
-  } catch (err) {
-    console.error("POST /flow/confirm-no-token:", err?.response?.data || err.message);
-    res.status(500).json({
-      ok: false,
-      error: "Fallo confirmación/envío (sin token)",
-      detail: err?.response?.data || err.message
-    });
+    res.status(500).json({ ok: false, error: "Fallo confirmación/envío", detail: err?.response?.data || err.message });
   }
 });
 
