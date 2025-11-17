@@ -3,7 +3,7 @@
  * - Firma HMAC-SHA256 (param "s") usando FLOW_SECRET_KEY
  * - Axios (x-www-form-urlencoded)
  * - CORS + x-client-secret (opcional)
- * - /health, /flow/create (POST/GET), /flow/confirm
+ * - /health, /flow/create (POST/GET), /flow/confirm, /flow/confirm-no-token
  * - Envío de eBook por SMTP real (SSL 465)
  ****************************************************/
 import express from "express";
@@ -42,7 +42,7 @@ const SMTP_HOST   = process.env.SMTP_HOST || "mail.flujosdigitales.com";
 const SMTP_PORT   = Number(process.env.SMTP_PORT || 465);
 const SMTP_USER   = process.env.SMTP_USER || "ventas@flujosdigitales.com";
 const SMTP_PASS   = process.env.SMTP_PASS || "";
-const FROM_EMAIL  = process.env.FROM_EMAIL || 'Flujos Digitales <ventas@flujosdigitales.com>';
+const FROM_EMAIL  = process.env.FROM_EMAIL || "Flujos Digitales <ventas@flujosdigitales.com>";
 
 const EBOOK_FILENAME     = "FlujosDigitales-100-Prompts.pdf";
 const EBOOK_PATH         = path.join(__dirname, "assets", EBOOK_FILENAME); // si no existe, se envía link
@@ -154,28 +154,25 @@ async function sendEbookEmail({ to, orderNumber }) {
 }
 
 /* ========= Flow helpers ========= */
-async function flowCreatePayment({ email, amount, subject = "eBook Flujos Digitales" }) {
-  const payload = {
-    apiKey: FLOW_API_KEY,
-    commerceOrder: `FD-${Date.now()}`,
-    subject,
-    currency: "CLP",
-    amount: Number(amount),
-    email,
-    urlReturn: `${SITE_BASE}/gracias.html`,
-    urlConfirmation: `${SITE_BASE}/gracias.html`
-  };
-  payload.s = signParams(payload);
 
-  const { data } = await flow.post("/payment/create", toForm(payload));
-  return data; // { url, token, ... }
-}
-
-async function flowGetStatusByToken(token) {
-  const payload = { apiKey: FLOW_API_KEY, token };
+// Helper genérico para consultar getStatus con distintos criterios (token, flowOrder, commerceOrder)
+async function flowGetStatus(criteria = {}) {
+  const payload = { apiKey: FLOW_API_KEY, ...criteria };
   payload.s = signParams(payload);
   const { data } = await flow.post("/payment/getStatus", toForm(payload));
   return data;
+}
+
+// Mantener compatibilidad con código existente
+async function flowGetStatusByToken(token) {
+  return flowGetStatus({ token });
+}
+
+// Nuevo helper por número de orden (flowOrder numérico o commerceOrder string)
+async function flowGetStatusByOrder(order) {
+  if (!order) throw new Error("Se requiere order para obtener el estado del pago");
+  const key = /^\d+$/.test(String(order)) ? "flowOrder" : "commerceOrder";
+  return flowGetStatus({ [key]: order });
 }
 
 /* ========= Rutas ========= */
@@ -185,20 +182,40 @@ app.post("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { email, amount, subject } = req.body || {};
-    if (!email || !amount) return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+    if (!email || !amount) {
+      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+    }
 
     if (!FLOW_API_KEY || !FLOW_SECRET) {
       return res.status(500).json({ ok: false, error: "Faltan credenciales de Flow (API_KEY o SECRET_KEY)" });
     }
 
-    const result = await flowCreatePayment({ email, amount, subject });
+    const payload = {
+      apiKey: FLOW_API_KEY,
+      commerceOrder: `FD-${Date.now()}`,
+      subject: subject || "eBook Flujos Digitales",
+      currency: "CLP",
+      amount: Number(amount),
+      email,
+      urlReturn: `${SITE_BASE}/gracias.html`,
+      urlConfirmation: `${SITE_BASE}/gracias.html`
+    };
+    payload.s = signParams(payload);
+
+    const { data: result } = await flow.post("/payment/create", toForm(payload));
+
     if (!result?.url) {
       return res.status(502).json({ ok: false, error: "Flow no devolvió URL", detail: result });
     }
+
     res.json({ ok: true, data: { url: result.url, token: result.token } });
   } catch (err) {
     console.error("POST /flow/create:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: "No se pudo crear el pago", detail: err?.response?.data || err.message });
+    res.status(500).json({
+      ok: false,
+      error: "No se pudo crear el pago",
+      detail: err?.response?.data || err.message
+    });
   }
 });
 
@@ -207,35 +224,59 @@ app.get("/flow/create", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { email, amount, subject } = req.query || {};
-    if (!email || !amount) return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+    if (!email || !amount) {
+      return res.status(400).json({ ok: false, error: "Faltan email o amount" });
+    }
 
     if (!FLOW_API_KEY || !FLOW_SECRET) {
       return res.status(500).json({ ok: false, error: "Faltan credenciales de Flow (API_KEY o SECRET_KEY)" });
     }
 
-    const result = await flowCreatePayment({ email, amount, subject });
+    const payload = {
+      apiKey: FLOW_API_KEY,
+      commerceOrder: `FD-${Date.now()}`,
+      subject: subject || "eBook Flujos Digitales",
+      currency: "CLP",
+      amount: Number(amount),
+      email,
+      urlReturn: `${SITE_BASE}/gracias.html`,
+      urlConfirmation: `${SITE_BASE}/gracias.html`
+    };
+    payload.s = signParams(payload);
+
+    const { data: result } = await flow.post("/payment/create", toForm(payload));
+
     if (!result?.url) {
       return res.status(502).json({ ok: false, error: "Flow no devolvió URL", detail: result });
     }
+
     res.json({ ok: true, data: { url: result.url, token: result.token } });
   } catch (err) {
     console.error("GET /flow/create:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: "No se pudo crear el pago (GET)", detail: err?.response?.data || err.message });
+    res.status(500).json({
+      ok: false,
+      error: "No se pudo crear el pago (GET)",
+      detail: err?.response?.data || err.message
+    });
   }
 });
 
-// Confirmación desde gracias.html (token + email opcional)
+// Confirmación desde gracias.html (token + email/opcional)
 app.post("/flow/confirm", async (req, res) => {
   try {
     if (!requireClientSecret(req, res)) return;
     const { token, email, order } = req.body || {};
-    if (!token) return res.status(400).json({ ok: false, error: "Falta token" });
+    if (!token) {
+      return res.status(400).json({ ok: false, error: "Falta token" });
+    }
 
     const st = await flowGetStatusByToken(token);
     const statusVal = String(st?.status ?? st?.paymentData?.status ?? "");
     const paid = statusVal === "2" || statusVal.toLowerCase() === "paid";
 
-    if (!paid) return res.status(202).json({ ok: false, message: "Pago aún no confirmado", detail: st });
+    if (!paid) {
+      return res.status(202).json({ ok: false, message: "Pago aún no confirmado", detail: st });
+    }
 
     const buyerEmail =
       email ||
@@ -253,11 +294,78 @@ app.post("/flow/confirm", async (req, res) => {
       await sendEbookEmail({ to: buyerEmail, orderNumber });
       return res.json({ ok: true, delivered: true, orderNumber });
     } else {
-      return res.json({ ok: true, delivered: false, reason: "Pago confirmado sin email", orderNumber });
+      return res.json({
+        ok: true,
+        delivered: false,
+        reason: "Pago confirmado sin email",
+        orderNumber
+      });
     }
   } catch (err) {
     console.error("POST /flow/confirm:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: "Fallo confirmación/envío", detail: err?.response?.data || err.message });
+    res.status(500).json({
+      ok: false,
+      error: "Fallo confirmación/envío",
+      detail: err?.response?.data || err.message
+    });
+  }
+});
+
+// Confirmación sin token (fallback desde gracias.html)
+app.post("/flow/confirm-no-token", async (req, res) => {
+  try {
+    if (!requireClientSecret(req, res)) return;
+    const { email, order } = req.body || {};
+
+    if (!order) {
+      return res.status(400).json({
+        ok: false,
+        error: "Falta order para buscar el pago (confirm-no-token)"
+      });
+    }
+
+    const st = await flowGetStatusByOrder(order);
+    const statusVal = String(st?.status ?? st?.paymentData?.status ?? "");
+    const paid = statusVal === "2" || statusVal.toLowerCase() === "paid";
+
+    if (!paid) {
+      return res.status(202).json({
+        ok: false,
+        message: "Pago aún no confirmado (sin token)",
+        detail: st
+      });
+    }
+
+    const buyerEmail =
+      email ||
+      st?.paymentData?.payer?.email ||
+      st?.payer?.email ||
+      st?.customer?.email;
+
+    const orderNumber =
+      order ||
+      st?.paymentData?.commerceOrder ||
+      st?.commerceOrder ||
+      st?.orderNumber;
+
+    if (buyerEmail) {
+      await sendEbookEmail({ to: buyerEmail, orderNumber });
+      return res.json({ ok: true, delivered: true, orderNumber });
+    } else {
+      return res.json({
+        ok: true,
+        delivered: false,
+        reason: "Pago confirmado sin email (fallback)",
+        orderNumber
+      });
+    }
+  } catch (err) {
+    console.error("POST /flow/confirm-no-token:", err?.response?.data || err.message);
+    res.status(500).json({
+      ok: false,
+      error: "Fallo confirmación/envío (sin token)",
+      detail: err?.response?.data || err.message
+    });
   }
 });
 
